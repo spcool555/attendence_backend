@@ -9,7 +9,7 @@ def test_login():
     print("=== Testing Admin Login ===")
     login_data = {
         "employee_id": "ADMIN001",
-        "password": "admin123"
+        "password": "AD#456"
     }
     
     response = requests.post(f"{BASE_URL}/login", json=login_data)

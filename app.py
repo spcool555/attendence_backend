@@ -72,7 +72,7 @@ def get_image_file_path(filename):
         return p3
     return None
 
-def embed_photos_in_excel(writer, sheet_name, image_map, row_height=65, max_size=(75, 75)):
+def embed_photos_in_excel(writer, sheet_name, image_map, row_height=65, max_size=(75, 75), merge_ranges=None):
     if sheet_name not in writer.sheets:
         return
     ws = writer.sheets[sheet_name]
@@ -83,6 +83,26 @@ def embed_photos_in_excel(writer, sheet_name, image_map, row_height=65, max_size
         if cell_val:
             header_col_map[str(cell_val).strip()] = (col, get_column_letter(col))
 
+    from PIL import Image as PILImage
+    from openpyxl.styles import Alignment
+    import io
+
+    # Apply vertical cell merging for common columns in group ranges
+    if merge_ranges:
+        # Merge all columns except Col 8 (Visit Date), Col 9 (Started At), Col 14 (Before Photo), Col 16 (Before Location), and Col 18 (Before Remark)
+        columns_to_merge = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 15, 17, 19]
+        for start_row, end_row in merge_ranges:
+            for col_num in columns_to_merge:
+                if col_num <= ws.max_column:
+                    try:
+                        ws.merge_cells(start_row=start_row, start_column=col_num, end_row=end_row, end_column=col_num)
+                        # Set top-left cell alignment to center content vertically
+                        top_cell = ws.cell(row=start_row, column=col_num)
+                        top_cell.alignment = Alignment(vertical='center', horizontal='left', wrap_text=True)
+                    except Exception as merge_err:
+                        print(f"Error merging rows {start_row}-{end_row} in column {col_num}: {merge_err}")
+
+    # Apply height and photo embedding
     for item in image_map:
         row_idx = item['row_idx']
         excel_row = row_idx + 2  # Row 1 is header
@@ -97,11 +117,29 @@ def embed_photos_in_excel(writer, sheet_name, image_map, row_height=65, max_size
                 try:
                     col_num, col_letter = header_col_map[col_name]
                     ws.column_dimensions[col_letter].width = 16
-                    img = OpenPyxlImage(file_path)
+                    
+                    # Open with PIL, convert to RGB, compress and make thumbnail for file size reduction
+                    with PILImage.open(file_path) as pil_img:
+                        if pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info):
+                            pil_img = pil_img.convert('RGB')
+                        # Make thumbnail at max 150x150 width/height
+                        pil_img.thumbnail((150, 150), PILImage.Resampling.LANCZOS)
+                        
+                        img_byte_arr = io.BytesIO()
+                        pil_img.save(img_byte_arr, format='JPEG', quality=75)
+                        img_byte_arr.seek(0)
+                        img = OpenPyxlImage(img_byte_arr)
+                    
                     img.width, img.height = max_size
                     ws.add_image(img, f'{col_letter}{excel_row}')
                 except Exception as err:
                     print(f"Error embedding image {photo_filename} into Excel: {err}")
+
+    # Set cell alignment to wrap text for multi-line columns
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            if cell.value and isinstance(cell.value, str) and '\n' in cell.value:
+                cell.alignment = Alignment(wrap_text=True, vertical='center')
 
 app = Flask(__name__)
 #CORS(app)
@@ -326,13 +364,38 @@ def login():
     data = request.get_json()
     employee_id = data.get('employee_id')
     password = data.get('password')
-    
+
     if not employee_id or not password:
         return jsonify({'error': 'Employee ID and password are required'}), 400
-    
-    employee = Employee.query.filter_by(id=employee_id, password=password).first()
-    
-    if employee:
+
+    # Retrieve employee record without password filter
+    employee = Employee.query.filter_by(id=employee_id).first()
+
+    if not employee:
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+    # Admin authentication using environment variable
+    if employee.is_admin:
+        admin_pass = os.getenv('ADMIN_PASSWORD')
+        if admin_pass and password == admin_pass:
+            return jsonify({
+                'success': True,
+                'employee': {
+                    'id': employee.id,
+                    'full_name': employee.full_name,
+                    'email': employee.email,
+                    'phone': employee.phone,
+                    'is_admin': employee.is_admin,
+                    'team': employee.team,
+                    'designation': employee.designation,
+                    'category': employee.category
+                }
+            })
+        else:
+            return jsonify({'error': 'Invalid admin credentials'}), 401
+
+    # Regular employee authentication using stored password
+    if employee.password == password:
         return jsonify({
             'success': True,
             'employee': {
@@ -348,6 +411,7 @@ def login():
         })
     else:
         return jsonify({'error': 'Invalid credentials'}), 401
+
 @app.route('/api/attendance/check-in', methods=['POST','OPTIONS'])
 def check_in():
     shift_type = request.form.get('shift_type') or 'general'
@@ -689,6 +753,18 @@ def create_employee():
     if Employee.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already exists'}), 400
     
+    # Map designation to team
+    designation = data.get('designation', '')
+    team_mapped = None
+    if designation:
+        desig_lower = designation.lower()
+        if 'field' in desig_lower:
+            team_mapped = 'field'
+        elif 'coc' in desig_lower or 'cooc' in desig_lower:
+            team_mapped = 'coc'
+        elif 'ccc' in desig_lower:
+            team_mapped = 'ccc'
+            
     employee = Employee(
         id=data['id'],
         full_name=data['full_name'],
@@ -697,8 +773,10 @@ def create_employee():
         password=data['password'],  # Plain text as requested
         is_admin=data.get('is_admin', False),
         shift_type=data.get('shift_type', 'general'),
-        weekly_off=data.get('weekly_off'),
-        category=data.get('category')
+        weekly_off=data.get('weekly_off') or 'Sunday',
+        category=data.get('category'),
+        designation=designation,
+        team=team_mapped
         )
     
     db.session.add(employee)
@@ -713,7 +791,9 @@ def create_employee():
             'email': employee.email,
             'phone': employee.phone,
             'is_admin': employee.is_admin,
-            'category': employee.category
+            'category': employee.category,
+            'designation': employee.designation,
+            'team': employee.team
         }
     })
 
@@ -1162,6 +1242,65 @@ def get_all_leaves():
     
     results = query.order_by(Leave.created_at.desc()).all()
     
+    current_year = date.today().year
+    emp_stats_cache = {}
+
+    def get_emp_stats(emp_id):
+        if emp_id in emp_stats_cache:
+            return emp_stats_cache[emp_id]
+
+        all_leaves = Leave.query.filter(
+            Leave.employee_id == emp_id,
+            db.extract('year', Leave.start_date) == current_year
+        ).all()
+
+        sick_used = 0
+        emergency_used = 0
+        comp_used = 0
+        lwp_used = 0
+        approved_days = 0
+
+        pending_count = 0
+        pending_days = 0
+
+        for l in all_leaves:
+            is_hd = getattr(l, 'is_half_day', False)
+            d_count = 0.5 if is_hd else (l.end_date - l.start_date).days + 1
+
+            if l.status == 'approved':
+                approved_days += d_count
+                if l.leave_type == 'sick':
+                    sick_used += d_count
+                elif l.leave_type == 'emergency':
+                    emergency_used += d_count
+                elif l.leave_type == 'Compensatory_off':
+                    comp_used += d_count
+                elif l.leave_type == 'lwp':
+                    lwp_used += d_count
+            elif l.status == 'pending':
+                pending_count += 1
+                pending_days += d_count
+
+        total_sick = 8
+        total_emergency = 8
+        total_comp = 8
+
+        stats = {
+            'approved_days_taken': approved_days,
+            'pending_requests_count': pending_count,
+            'pending_days_count': pending_days,
+            'sick_used': sick_used,
+            'emergency_used': emergency_used,
+            'comp_used': comp_used,
+            'lwp_used': lwp_used,
+            'sick_remaining': max(0, total_sick - sick_used),
+            'emergency_remaining': max(0, total_emergency - emergency_used),
+            'comp_remaining': max(0, total_comp - comp_used),
+            'total_remaining': max(0, total_sick - sick_used) + max(0, total_emergency - emergency_used) + max(0, total_comp - comp_used)
+        }
+        emp_stats_cache[emp_id] = stats
+        return stats
+
     leaves = []
     for leave, employee in results:
         # Safe attribute access for backward compatibility
@@ -1184,7 +1323,8 @@ def get_all_leaves():
             'half_day_period': half_day_period,
             'supporting_document': getattr(leave, 'supporting_document', None),
             'created_at': to_ist(leave.created_at),
-            'days_count': 0.5 if is_half_day else (leave.end_date - leave.start_date).days + 1
+            'days_count': 0.5 if is_half_day else (leave.end_date - leave.start_date).days + 1,
+            'employee_stats': get_emp_stats(leave.employee_id)
         })
     
     return jsonify(leaves)
@@ -1566,11 +1706,31 @@ class JunctionVisit(db.Model):
     status = db.Column(db.String(20), default='in_progress')  # 'in_progress' | 'completed'
     visit_type = db.Column(db.String(50), default='Regular Visit')
     remark = db.Column(db.Text)
+    before_remark = db.Column(db.Text)
     asset_type = db.Column(db.String(100))
     fault_type = db.Column(db.String(100))
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
 
     employee = db.relationship('Employee', backref='junction_visits')
+
+
+class CallVisit(db.Model):
+    """A call visit made to resolve an unresolved junction visit."""
+    __tablename__ = 'call_visit'
+    id = db.Column(db.Integer, primary_key=True)
+    junction_visit_id = db.Column(db.Integer, db.ForeignKey('junction_visit.id'), nullable=False)
+    before_photo = db.Column(db.String(255))
+    after_photo = db.Column(db.String(255))
+    before_location = db.Column(db.String(100))
+    after_location = db.Column(db.String(100))
+    started_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
+    completed_at = db.Column(db.DateTime)
+    status = db.Column(db.String(20), default='in_progress')  # 'in_progress' | 'completed' | 'unresolved'
+    remark = db.Column(db.Text)
+    before_remark = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
+
+    junction_visit = db.relationship('JunctionVisit', backref=db.backref('call_visits', lazy=True))
 
 
 class AssetFaultMapping(db.Model):
@@ -1675,6 +1835,20 @@ def upload_locations_excel():
             if not loc_col:
                 return jsonify({'error': f'For {team.upper()} team, file must have "Employee Name" and "Location Name" columns. Download the sample Excel for reference.'}), 400
 
+        # Find Ward & Zone columns if present
+        col_clean_map_loc = {str(c).strip().lower(): c for c in df.columns}
+        ward_col_loc = None
+        for w_cand in ['ward', 'ward name', 'ward_name', 'ward no', 'ward_no', 'wards']:
+            if w_cand in col_clean_map_loc:
+                ward_col_loc = col_clean_map_loc[w_cand]
+                break
+        
+        zone_col_loc = None
+        for z_cand in ['zone', 'zone name', 'zone_name', 'zone no', 'zone_no', 'zones']:
+            if z_cand in col_clean_map_loc:
+                zone_col_loc = col_clean_map_loc[z_cand]
+                break
+
         added_employees = 0
         added_locations = 0
         skipped = 0
@@ -1684,15 +1858,21 @@ def upload_locations_excel():
             if not emp_name:
                 continue
 
+            w_val = str(row.get(ward_col_loc, '')).strip() if ward_col_loc else None
+            z_val = str(row.get(zone_col_loc, '')).strip() if zone_col_loc else None
+            if w_val and w_val.lower() == 'nan': w_val = None
+            if z_val and z_val.lower() == 'nan': z_val = None
+
             if team == 'field':
-                # Field team: just register the employee name as a location entry
-                # (used for junction visit tracking, not a physical location)
+                # Field team: register employee name as location entry
                 exists = LocationList.query.filter_by(name=emp_name, team=team).first()
                 if not exists:
-                    new_entry = LocationList(name=emp_name, team=team)
+                    new_entry = LocationList(name=emp_name, team=team, ward=w_val, zone=z_val)
                     db.session.add(new_entry)
                     added_employees += 1
                 else:
+                    if w_val: exists.ward = w_val
+                    if z_val: exists.zone = z_val
                     skipped += 1
             else:
                 # COC/CCC: get location name and register both
@@ -1704,18 +1884,23 @@ def upload_locations_excel():
                 # Create location if not exists
                 loc = LocationList.query.filter_by(name=loc_name, team=team).first()
                 if not loc:
-                    loc = LocationList(name=loc_name, team=team)
+                    loc = LocationList(name=loc_name, team=team, ward=w_val, zone=z_val)
                     db.session.add(loc)
                     added_locations += 1
+                else:
+                    if w_val: loc.ward = w_val
+                    if z_val: loc.zone = z_val
 
-                # Store the employee-location mapping as another entry
+                # Store employee-location mapping
                 emp_loc_key = f"{emp_name} @ {loc_name}"
                 emp_exists = LocationList.query.filter_by(name=emp_loc_key, team=f"{team}_emp").first()
                 if not emp_exists:
-                    emp_entry = LocationList(name=emp_loc_key, team=f"{team}_emp")
+                    emp_entry = LocationList(name=emp_loc_key, team=f"{team}_emp", ward=w_val, zone=z_val)
                     db.session.add(emp_entry)
                     added_employees += 1
                 else:
+                    if w_val: emp_exists.ward = w_val
+                    if z_val: emp_exists.zone = z_val
                     skipped += 1
 
         db.session.commit()
@@ -1743,7 +1928,7 @@ def download_employees_sample_excel():
         'Email': ['snehal@example.com', 'amit@example.com', 'priya@example.com'],
         'Phone': ['9876543210', '9876543211', '9876543212'],
         'Password': ['pass123', 'pass456', 'pass789'],
-        'Designation': ['Field Team', 'CoC', 'CCC'],
+        'Team': ['Field Team', 'CoC', 'CCC'],
         'Category': ['Smart City', 'IITMS', 'Construction']
     }
     df = pd.DataFrame(data)
@@ -1776,8 +1961,17 @@ def upload_employees_excel():
         # Normalize column names (strip spaces)
         df.columns = [c.strip() for c in df.columns]
 
+        # Check for Team/Designation column
+        desig_col = None
+        for candidate in ['Team', 'team', 'TEAM', 'Designation', 'designation', 'DESIGNATION']:
+            if candidate in df.columns:
+                desig_col = candidate
+                break
+        if not desig_col:
+            return jsonify({'error': 'Missing Designation/Team column. File must have a "Team" or "Designation" column.'}), 400
+
         # Check required columns
-        required_cols = ['Employee ID', 'Full Name', 'Email', 'Phone', 'Password', 'Designation']
+        required_cols = ['Employee ID', 'Full Name', 'Email', 'Phone', 'Password']
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             return jsonify({'error': f'Missing columns: {", ".join(missing_cols)}'}), 400
@@ -1799,18 +1993,7 @@ def upload_employees_excel():
                 s = s[:-2]
             return s
 
-        # Clear existing records first to allow clean import of new IDs
-        try:
-            # Delete in order of foreign key dependencies
-            db.session.query(Announcement).delete()
-            db.session.query(JunctionVisit).delete()
-            db.session.query(Attendance).delete()
-            db.session.query(Leave).delete()
-            db.session.query(Employee).delete()
-            db.session.commit()
-        except Exception as delete_error:
-            db.session.rollback()
-            return jsonify({'error': f'Failed to clear old employee data: {str(delete_error)}'}), 500
+        # Process spreadsheet rows to add or update employees
 
         added_count = 0
         updated_count = 0
@@ -1829,7 +2012,7 @@ def upload_employees_excel():
             email = clean_val(row['Email']).lower()
             phone = clean_val(row['Phone'])
             password = clean_val(row['Password'])
-            designation = clean_val(row['Designation'])
+            designation = clean_val(row[desig_col])
             category_val = clean_val(row[group_col])
 
             if not full_name or full_name.lower() == 'nan':
@@ -1838,11 +2021,11 @@ def upload_employees_excel():
             # Map designation to team
             team_mapped = None
             desig_lower = designation.lower()
-            if desig_lower == 'field team':
+            if 'field' in desig_lower:
                 team_mapped = 'field'
-            elif desig_lower == 'coc':
+            elif 'coc' in desig_lower or 'cooc' in desig_lower:
                 team_mapped = 'coc'
-            elif desig_lower == 'ccc':
+            elif 'ccc' in desig_lower:
                 team_mapped = 'ccc'
 
             # Normalize category value
@@ -1903,7 +2086,7 @@ def upload_employees_excel():
                     full_name=adm['full_name'],
                     email=adm['email'],
                     phone=adm['phone'],
-                    password=adm['password'],
+                    password=os.getenv(f"{adm['id']}_PASSWORD", adm['password']),
                     is_admin=True,
                     category=adm['category'],
                     weekly_off='Sunday',
@@ -1916,7 +2099,7 @@ def upload_employees_excel():
 
         return jsonify({
             'success': True,
-            'message': f'Uploaded successfully. Added {added_count} new/admin employees after resetting database.'
+            'message': f'Uploaded successfully. Added {added_count} new/admin employees and updated {updated_count} existing employees.'
         })
 
     except Exception as e:
@@ -2040,6 +2223,7 @@ def junction_start():
     location = request.form.get('location')
     ward = request.form.get('ward')
     zone = request.form.get('zone')
+    before_remark = request.form.get('before_remark')
 
     if not employee_id or not junction_name or not location:
         return jsonify({'error': 'employee_id, junction_name and location are required'}), 400
@@ -2108,6 +2292,7 @@ def junction_start():
         after_photo=before_photo_filename if is_completed_immediately else None,
         after_location=location if is_completed_immediately else None,
         remark='Regular Visit (No Fault)' if is_completed_immediately else None,
+        before_remark=before_remark.strip() if before_remark else None,
         visit_type=visit_type,
         asset_type=asset_type,
         fault_type=fault_type
@@ -2193,6 +2378,155 @@ def junction_complete(visit_id):
     })
 
 
+@app.route('/api/junction/<int:visit_id>/call-visit/start', methods=['POST'])
+def call_visit_start(visit_id):
+    """Starts a call visit for an unresolved junction visit."""
+    employee_id = request.form.get('employee_id')
+    location = request.form.get('location')
+    before_remark = request.form.get('before_remark')
+    
+    if not employee_id or not location:
+        return jsonify({'error': 'employee_id and location are required'}), 400
+
+    employee = Employee.query.get(employee_id)
+    if not employee:
+        return jsonify({'error': 'Employee not found'}), 404
+
+    # Check if checked in today
+    today = datetime.utcnow().date()
+    checked_in_today = Attendance.query.filter(
+        Attendance.employee_id == employee_id,
+        Attendance.date == today,
+        Attendance.check_in_time.isnot(None)
+    ).first()
+    if not checked_in_today:
+        return jsonify({'error': 'Please check in for the day before logging a call visit'}), 400
+
+    # Auto-close any in_progress Call Visits for this employee
+    open_cvs = CallVisit.query.join(JunctionVisit).filter(
+        JunctionVisit.employee_id == employee_id,
+        CallVisit.status == 'in_progress'
+    ).all()
+    for ocv in open_cvs:
+        ocv.status = 'unresolved'
+        ocv.completed_at = datetime.utcnow()
+        ocv.remark = 'Unresolved'
+
+    # Also auto-close any regular in-progress junction visits for consistency
+    open_visits = JunctionVisit.query.filter_by(
+        employee_id=employee_id,
+        status='in_progress'
+    ).all()
+    for ov in open_visits:
+        ov.status = 'unresolved'
+        ov.completed_at = datetime.utcnow()
+        ov.remark = 'Unresolved'
+
+    photo_filename = None
+    if 'photo' in request.files:
+        file = request.files['photo']
+        if file and allowed_file(file.filename):
+            filename = secure_filename(
+                f"{employee_id}{datetime.now().strftime('%Y%m%d%H%M%S')}_call_before.{file.filename.rsplit('.', 1)[1].lower()}"
+            )
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            photo_filename = filename
+
+    if not photo_filename:
+        return jsonify({'error': 'Before photo is required'}), 400
+
+    new_cv = CallVisit(
+        junction_visit_id=visit_id,
+        before_photo=photo_filename,
+        before_location=location,
+        started_at=datetime.utcnow(),
+        status='in_progress',
+        before_remark=before_remark.strip() if before_remark else None
+    )
+    db.session.add(new_cv)
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': 'Call visit started',
+        'call_visit': {
+            'id': new_cv.id,
+            'junction_visit_id': new_cv.junction_visit_id,
+            'started_at': to_ist(new_cv.started_at),
+            'before_photo': new_cv.before_photo,
+            'before_location': new_cv.before_location,
+            'before_remark': new_cv.before_remark or '',
+            'status': new_cv.status
+        }
+    })
+
+
+@app.route('/api/junction/<int:visit_id>/call-visit/complete', methods=['POST'])
+def call_visit_complete(visit_id):
+    """Completes the active call visit for this junction visit."""
+    location = request.form.get('location')
+    remark = request.form.get('remark')
+    
+    if not location:
+        return jsonify({'error': 'Location is required'}), 400
+    if not remark or not remark.strip():
+        return jsonify({'error': 'Remark is compulsory'}), 400
+
+    visit = JunctionVisit.query.get(visit_id)
+    if not visit:
+        return jsonify({'error': 'Junction visit not found'}), 404
+
+    active_cv = CallVisit.query.filter_by(
+        junction_visit_id=visit_id,
+        status='in_progress'
+    ).first()
+    if not active_cv:
+        return jsonify({'error': 'No active call visit found for this junction visit'}), 400
+
+    after_photo_filename = None
+    if 'photo' in request.files:
+        file = request.files['photo']
+        if file and allowed_file(file.filename):
+            filename = secure_filename(
+                f"{visit.employee_id}{datetime.now().strftime('%Y%m%d%H%M%S')}_call_after.{file.filename.rsplit('.', 1)[1].lower()}"
+            )
+            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+            after_photo_filename = filename
+
+    if not after_photo_filename:
+        return jsonify({'error': 'After photo is required'}), 400
+
+    # Update active call visit
+    active_cv.after_photo = after_photo_filename
+    active_cv.after_location = location
+    active_cv.remark = remark.strip()
+    active_cv.completed_at = datetime.utcnow()
+    active_cv.status = 'completed'
+
+    # Update parent junction visit status and photos
+    visit.after_photo = after_photo_filename
+    visit.after_location = location
+    visit.completed_at = active_cv.completed_at
+    visit.remark = remark.strip()
+    visit.status = 'completed'
+
+    db.session.commit()
+
+    return jsonify({
+        'success': True,
+        'message': 'Call visit completed and junction visit marked as complete',
+        'call_visit': {
+            'id': active_cv.id,
+            'junction_visit_id': active_cv.junction_visit_id,
+            'after_photo': active_cv.after_photo,
+            'after_location': active_cv.after_location,
+            'completed_at': to_ist(active_cv.completed_at),
+            'status': active_cv.status,
+            'remark': active_cv.remark
+        }
+    })
+
+
 @app.route('/api/junction/today/<employee_id>', methods=['GET'])
 def junction_today(employee_id):
     try:
@@ -2202,27 +2536,42 @@ def junction_today(employee_id):
             JunctionVisit.employee_id == employee_id,
             or_(
                 JunctionVisit.date == today,
-                JunctionVisit.status == 'in_progress'
+                JunctionVisit.status == 'in_progress',
+                JunctionVisit.status == 'unresolved'
             )
         ).order_by(JunctionVisit.id.desc()).all()
 
-        return jsonify([{
-            'id': v.id,
-            'junction_name': v.junction_name,
-            'ward': v.ward or '',
-            'zone': v.zone or '',
-            'before_photo': v.before_photo,
-            'after_photo': v.after_photo,
-            'before_location': v.before_location,
-            'after_location': v.after_location,
-            'started_at': to_ist(v.started_at),
-            'completed_at': to_ist(v.completed_at),
-            'status': v.status,
-            'visit_type': v.visit_type,
-            'asset_type': v.asset_type or '',
-            'fault_type': v.fault_type or '',
-            'remark': v.remark
-        } for v in visits])
+        serialized = []
+        for v in visits:
+            active_cv = CallVisit.query.filter_by(junction_visit_id=v.id, status='in_progress').first()
+            serialized.append({
+                'id': v.id,
+                'junction_name': v.junction_name,
+                'ward': v.ward or '',
+                'zone': v.zone or '',
+                'before_photo': v.before_photo,
+                'after_photo': v.after_photo,
+                'before_location': v.before_location,
+                'after_location': v.after_location,
+                'started_at': to_ist(v.started_at),
+                'completed_at': to_ist(v.completed_at),
+                'status': v.status,
+                'visit_type': v.visit_type,
+                'asset_type': v.asset_type or '',
+                'fault_type': v.fault_type or '',
+                'remark': v.remark,
+                'before_remark': v.before_remark or '',
+                'active_call_visit': {
+                    'id': active_cv.id,
+                    'before_photo': active_cv.before_photo,
+                    'before_location': active_cv.before_location,
+                    'started_at': to_ist(active_cv.started_at),
+                    'before_remark': active_cv.before_remark or '',
+                    'status': active_cv.status
+                } if active_cv else None
+            })
+
+        return jsonify(serialized)
 
     except Exception as e:
         print("JUNCTION TODAY ERROR:", e)
@@ -2432,32 +2781,46 @@ def upload_junctions_excel():
                     df = df.iloc[r_idx + 1:].reset_index(drop=True)
                     break
             
-        # Normalize columns
-        df.columns = [c.strip() for c in df.columns]
-            
-        # Find Junction Name column (support aliases like Location, location, JUNCTION, name)
-        junction_col = None
-        for candidate in candidates:
-            if candidate in df.columns:
-                junction_col = candidate
-                break
+        # Normalize columns map for case-insensitive matching
+        col_clean_map = {str(c).strip().lower(): c for c in df.columns}
+        
+        def match_column(candidates, substrings=None):
+            for cand in candidates:
+                if cand.lower() in col_clean_map:
+                    return col_clean_map[cand.lower()]
+            if substrings:
+                for k, orig in col_clean_map.items():
+                    for sub in substrings:
+                        if sub.lower() in k:
+                            return orig
+            return None
+
+        # Find Junction Name column
+        junction_candidates = [
+            'junction name', 'junction', 'location name', 'location', 
+            'site name', 'site', 'junction_name', 'location_name', 'name', 
+            'location / junction', 'location/junction', 'junction/location', 'junction / location'
+        ]
+        junction_col = match_column(junction_candidates, ['junction', 'location', 'site'])
 
         if not junction_col:
             return jsonify({'error': 'Missing "Junction Name" (or "Location", "Junction") column in the uploaded file.'}), 400
             
         # Find Ward column
-        ward_col = None
-        for candidate in ['Ward', 'ward', 'Ward Name', 'ward name', 'WARD', 'FROM WARD', 'TO WARD', 'FROM_WARD', 'TO_WARD', 'TO WARD']:
-            if candidate in df.columns:
-                ward_col = candidate
-                break
+        ward_candidates = [
+            'ward', 'ward name', 'ward_name', 'ward no', 'ward no.', 'ward_no', 
+            'ward number', 'wards', 'from ward', 'to ward', 'from_ward', 'to_ward', 
+            'ward/zone', 'ward code', 'ward_code', 'ward_id', 'ward id'
+        ]
+        ward_col = match_column(ward_candidates, ['ward'])
 
         # Find Zone column
-        zone_col = None
-        for candidate in ['Zone', 'zone', 'Zone Name', 'zone name', 'ZONE']:
-            if candidate in df.columns:
-                zone_col = candidate
-                break
+        zone_candidates = [
+            'zone', 'zone name', 'zone_name', 'zone no', 'zone no.', 'zone_no', 
+            'zone number', 'zones', 'from zone', 'to zone', 'from_zone', 'to_zone', 
+            'zone code', 'zone_code', 'zone_id', 'zone id'
+        ]
+        zone_col = match_column(zone_candidates, ['zone'])
                 
         def clean_val(val):
             if pd.isna(val):
@@ -2494,6 +2857,16 @@ def upload_junctions_excel():
                 if zone_val is not None:
                     exists.zone = zone_val
                 updated_count += 1
+
+            loc_exists = LocationList.query.filter_by(name=name, team='field').first()
+            if not loc_exists:
+                new_loc = LocationList(name=name, team='field', ward=ward_val, zone=zone_val)
+                db.session.add(new_loc)
+            else:
+                if ward_val is not None:
+                    loc_exists.ward = ward_val
+                if zone_val is not None:
+                    loc_exists.zone = zone_val
                  
         db.session.commit()
         return jsonify({'success': True, 'message': f'Successfully processed junctions. Added {added_count} new, updated {updated_count}.'})
@@ -2559,7 +2932,7 @@ def admin_team_summary(team):
         ).count()
         active_junctions = JunctionVisit.query.filter(
             JunctionVisit.employee_id.in_(member_ids),
-            JunctionVisit.status == 'in_progress',
+            JunctionVisit.status.in_(['in_progress', 'unresolved']),
             JunctionVisit.date <= today
         ).count()
 
@@ -2664,7 +3037,7 @@ def admin_team_junctions(team):
                     JunctionVisit.date == target_date,
                     db.func.date(JunctionVisit.completed_at) == target_date,
                     and_(
-                        JunctionVisit.status == 'in_progress',
+                        JunctionVisit.status.in_(['in_progress', 'unresolved']),
                         JunctionVisit.date <= target_date
                     )
                 )
@@ -2677,11 +3050,21 @@ def admin_team_junctions(team):
     junction_names = list(set([v.junction_name for v, e in results]))
     counts_map = {}
     if junction_names:
-        counts_query = db.session.query(
+        # Count main visits
+        main_counts = db.session.query(
             JunctionVisit.junction_name, 
             db.func.count(JunctionVisit.id)
         ).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
-        counts_map = {name: count for name, count in counts_query}
+        
+        # Count call visits
+        call_counts = db.session.query(
+            JunctionVisit.junction_name, 
+            db.func.count(CallVisit.id)
+        ).join(CallVisit).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
+        
+        main_map = {name: count for name, count in main_counts}
+        call_map = {name: count for name, count in call_counts}
+        counts_map = {name: main_map.get(name, 0) + call_map.get(name, 0) for name in junction_names}
 
     return jsonify([{
         'id': v.id,
@@ -2702,7 +3085,20 @@ def admin_team_junctions(team):
         'visit_type': v.visit_type,
         'asset_type': v.asset_type or '',
         'fault_type': v.fault_type or '',
-        'remark': 'Unresolved' if v.remark == 'Auto-closed (Left unresolved)' else (v.remark or '')
+        'remark': 'Unresolved' if v.remark == 'Auto-closed (Left unresolved)' else (v.remark or ''),
+        'before_remark': v.before_remark or '',
+        'call_visits': [{
+            'id': cv.id,
+            'before_photo': cv.before_photo,
+            'after_photo': cv.after_photo,
+            'before_location': cv.before_location,
+            'after_location': cv.after_location,
+            'started_at': to_ist(cv.started_at),
+            'completed_at': to_ist(cv.completed_at),
+            'before_remark': cv.before_remark or '',
+            'remark': cv.remark or '',
+            'status': cv.status
+        } for cv in sorted(v.call_visits, key=lambda x: x.id)]
     } for v, e in results])
 
 
@@ -2754,7 +3150,7 @@ def admin_team_junctions_export(team):
                         JunctionVisit.date == target_date,
                         db.func.date(JunctionVisit.completed_at) == target_date,
                         and_(
-                            JunctionVisit.status == 'in_progress',
+                            JunctionVisit.status.in_(['in_progress', 'unresolved']),
                             JunctionVisit.date <= target_date
                         )
                     )
@@ -2767,17 +3163,57 @@ def admin_team_junctions_export(team):
         junction_names = list(set([v.junction_name for v, e in results]))
         counts_map = {}
         if junction_names:
-            counts_query = db.session.query(
+            # Count main visits
+            main_counts = db.session.query(
                 JunctionVisit.junction_name, 
                 db.func.count(JunctionVisit.id)
             ).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
-            counts_map = {name: count for name, count in counts_query}
+            
+            # Count call visits
+            call_counts = db.session.query(
+                JunctionVisit.junction_name, 
+                db.func.count(CallVisit.id)
+            ).join(CallVisit).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
+            
+            main_map = {name: count for name, count in main_counts}
+            call_map = {name: count for name, count in call_counts}
+            counts_map = {name: main_map.get(name, 0) + call_map.get(name, 0) for name in junction_names}
 
         data = []
         image_map = []
-        for idx, (v, e) in enumerate(results):
+        merge_ranges = []
+        row_counter = 0
+        for (v, e) in results:
             started_ist = utc_to_ist_dt(v.started_at).strftime('%Y-%m-%d %H:%M:%S') if v.started_at else '—'
-            completed_ist = utc_to_ist_dt(v.completed_at).strftime('%Y-%m-%d %H:%M:%S') if v.completed_at else '—'
+            
+            # 1. Completed date should NOT be shown if status is unresolved (jab tak unresolved hai completed date nahi dikhega)
+            completed_ist = '—'
+            if v.status == 'completed' and v.completed_at:
+                completed_ist = utc_to_ist_dt(v.completed_at).strftime('%Y-%m-%d %H:%M:%S')
+                
+            # 2. Before photo and before location should show the latest call visit's photo/location if present
+            display_before_photo = v.before_photo
+            display_before_location = v.before_location
+            if v.call_visits:
+                latest_cv = sorted(v.call_visits, key=lambda x: x.id)[-1]
+                if latest_cv.before_photo:
+                    display_before_photo = latest_cv.before_photo
+                if latest_cv.before_location:
+                    display_before_location = latest_cv.before_location
+
+            # 3. Completion remark in 'Remark' column (no call visit dates or attempt lists here)
+            main_remark = v.remark or '—'
+            if v.remark == 'Auto-closed (Left unresolved)':
+                main_remark = 'Unresolved'
+                
+            group_size = 1 + len(v.call_visits)
+            start_excel_row = row_counter + 2
+            end_excel_row = start_excel_row + group_size - 1
+            if group_size > 1:
+                merge_ranges.append((start_excel_row, end_excel_row))
+                
+            # Append parent row
+            main_visit_date = v.date.strftime('%d-%m-%Y') if v.date else '—'
             data.append({
                 'Employee ID': v.employee_id,
                 'Employee Name': e.full_name,
@@ -2786,32 +3222,71 @@ def admin_team_junctions_export(team):
                 'Visit Type': v.visit_type or 'Regular Visit',
                 'Ward': v.ward or '',
                 'Zone': v.zone or '',
-                'Visit Date': v.date.strftime('%d-%m-%Y') if v.date else '—',
+                'Visit Date': main_visit_date,
                 'Started At (IST)': started_ist,
                 'Completed At (IST)': completed_ist,
-                'Status': 'Completed' if v.status == 'completed' else 'Open',
+                'Status': 'Completed' if v.status == 'completed' else ('Unresolved' if v.status == 'unresolved' else 'Open'),
                 'Asset Type': v.asset_type or '—',
                 'Fault Type': v.fault_type or '—',
                 'Before Photo': v.before_photo or '—',
                 'After Photo': v.after_photo or '—',
                 'Before Location': v.before_location or '—',
                 'After Location': v.after_location or '—',
-                'Remark': 'Unresolved' if v.remark == 'Auto-closed (Left unresolved)' else (v.remark or '—')
+                'Before Remark': v.before_remark or '—',
+                'Remark': main_remark
             })
+            
             image_map.append({
-                'row_idx': idx,
+                'row_idx': row_counter,
                 'photos': {
                     'Before Photo': v.before_photo,
                     'After Photo': v.after_photo
                 }
             })
+            row_counter += 1
+            
+            # Append call visits rows (each row shows its own call visit's before photo, before location, before remark)
+            for cv in sorted(v.call_visits, key=lambda x: x.id):
+                cv_started_date = utc_to_ist_dt(cv.started_at).strftime('%d-%m-%Y') if cv.started_at else '—'
+                cv_started_time = utc_to_ist_dt(cv.started_at).strftime('%Y-%m-%d %H:%M:%S') if cv.started_at else '—'
+                
+                data.append({
+                    'Employee ID': v.employee_id,
+                    'Employee Name': e.full_name,
+                    'Junction Name': v.junction_name,
+                    'Number of Visits': counts_map.get(v.junction_name, 0),
+                    'Visit Type': v.visit_type or 'Regular Visit',
+                    'Ward': v.ward or '',
+                    'Zone': v.zone or '',
+                    'Visit Date': cv_started_date,
+                    'Started At (IST)': cv_started_time,
+                    'Completed At (IST)': completed_ist,
+                    'Status': 'Completed' if v.status == 'completed' else ('Unresolved' if v.status == 'unresolved' else 'Open'),
+                    'Asset Type': v.asset_type or '—',
+                    'Fault Type': v.fault_type or '—',
+                    'Before Photo': cv.before_photo or '—',
+                    'After Photo': v.after_photo or '—',
+                    'Before Location': cv.before_location or '—',
+                    'After Location': v.after_location or '—',
+                    'Before Remark': cv.before_remark or '—',
+                    'Remark': main_remark
+                })
+                
+                image_map.append({
+                    'row_idx': row_counter,
+                    'photos': {
+                        'Before Photo': cv.before_photo
+                    }
+                })
+                row_counter += 1
+                
         df = pd.DataFrame(data)
 
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Junction Visits')
         if not df.empty:
-            embed_photos_in_excel(writer, 'Junction Visits', image_map)
+            embed_photos_in_excel(writer, 'Junction Visits', image_map, merge_ranges=merge_ranges)
     output.seek(0)
 
     filename = f'junction_visits_{team}_{datetime.utcnow().date().isoformat()}.xlsx'
@@ -3089,18 +3564,18 @@ if __name__ == "__main__":
         db.create_all()
         auto_migrate_db()
 
-        # Create default admin if no admin exists
+    # Create default admin if no admin exists
         if not Employee.query.filter_by(is_admin=True).first():
             default_admin = Employee(
                 id='ADMIN001',
                 full_name='System Administrator',
                 email='multisulotionsdecofurn@gmail.com',
                 phone='+919518791736',
-                password='AD#987',
+                password='AD#456',
                 is_admin=True
             )
             db.session.add(default_admin)
             db.session.commit()
-            print("Default admin created: ID=ADMIN001, Password=AD#987")
+            print("Default admin created successfully.")
 
         app.run(debug=True, host='0.0.0.0', port=5001)
