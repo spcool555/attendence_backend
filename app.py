@@ -152,9 +152,8 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your-secret-key-here')
 DB_HOST = os.getenv('DB_HOST', '31.97.224.19')
 DB_USER = os.getenv('DB_USER', 'spcool')
 DB_PASSWORD = quote_plus(os.getenv('DB_PASSWORD', 'Spcool@123'))
-DB_PORT = os.getenv('DB_PORT', '3306')
 DB_NAME = os.getenv('DB_NAME', 'decofurn')
-
+DB_PORT = os.getenv('DB_PORT', '3306')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'mysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -374,10 +373,10 @@ def login():
     if not employee:
         return jsonify({'error': 'Invalid credentials'}), 401
 
-    # Admin authentication using environment variable
+    # Admin authentication: check stored employee password or ADMIN_PASSWORD env variable
     if employee.is_admin:
         admin_pass = os.getenv('ADMIN_PASSWORD')
-        if admin_pass and password == admin_pass:
+        if employee.password == password or (admin_pass and password == admin_pass):
             return jsonify({
                 'success': True,
                 'employee': {
@@ -764,6 +763,8 @@ def create_employee():
             team_mapped = 'coc'
         elif 'ccc' in desig_lower:
             team_mapped = 'ccc'
+        elif 'towing' in desig_lower:
+            team_mapped = 'towing'
             
     employee = Employee(
         id=data['id'],
@@ -1709,9 +1710,28 @@ class JunctionVisit(db.Model):
     before_remark = db.Column(db.Text)
     asset_type = db.Column(db.String(100))
     fault_type = db.Column(db.String(100))
+    time_spent_minutes = db.Column(db.Float, default=0.0)
+    travel_time_minutes = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
 
     employee = db.relationship('Employee', backref='junction_visits')
+
+
+class LocationPing(db.Model):
+    """Stores background/periodic GPS location pings of roaming/field employees during shift hours."""
+    __tablename__ = 'location_ping'
+    id = db.Column(db.Integer, primary_key=True)
+    employee_id = db.Column(db.String(50), db.ForeignKey('employee.id'), nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    accuracy = db.Column(db.Float, nullable=True)
+    speed = db.Column(db.Float, nullable=True)
+    battery_level = db.Column(db.Float, nullable=True)
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC), index=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
+
+    employee = db.relationship('Employee', backref=db.backref('location_pings', lazy='dynamic'))
+
 
 
 class CallVisit(db.Model):
@@ -1765,22 +1785,23 @@ TEAM_LABELS = {
     'field': 'Junction',
     'coc':   'COC Location',
     'ccc':   'CCC Location',
+    'towing': 'Junction',
 }
 
-ALLOWED_VISIT_TEAMS = ('field', 'coc', 'ccc')
+ALLOWED_VISIT_TEAMS = ('field', 'coc', 'ccc', 'towing')
 
 
 @app.route('/api/locations', methods=['GET'])
 def get_locations():
     """Returns the list of predefined locations for a specific team.
-    Query param: ?team=field|coc|ccc
-    Falls back to JunctionList (legacy) for field team if LocationList is empty."""
+    Query param: ?team=field|coc|ccc|towing
+    Falls back to JunctionList (legacy) for field & towing teams if LocationList is empty."""
     team = (request.args.get('team') or 'field').lower()
 
     if team not in ALLOWED_VISIT_TEAMS:
-        return jsonify({'error': 'Invalid team. Must be field, coc, or ccc'}), 400
+        return jsonify({'error': 'Invalid team. Must be field, coc, ccc, or towing'}), 400
 
-    if team == 'field':
+    if team in ('field', 'towing'):
         locations = JunctionList.query.order_by(JunctionList.name.asc()).all()
         return jsonify([{'id': loc.id, 'name': loc.name, 'ward': loc.ward or '', 'zone': loc.zone or ''} for loc in locations])
 
@@ -1929,7 +1950,7 @@ def download_employees_sample_excel():
         'Phone': ['9876543210', '9876543211', '9876543212'],
         'Password': ['pass123', 'pass456', 'pass789'],
         'Team': ['Field Team', 'CoC', 'CCC'],
-        'Category': ['Smart City', 'IITMS', 'Construction']
+        'Category': ['Smart City', 'IITMS', 'Towing']
     }
     df = pd.DataFrame(data)
     output = BytesIO()
@@ -2027,6 +2048,8 @@ def upload_employees_excel():
                 team_mapped = 'coc'
             elif 'ccc' in desig_lower:
                 team_mapped = 'ccc'
+            elif 'towing' in desig_lower:
+                team_mapped = 'towing'
 
             # Normalize category value
             category_val_lower = category_val.lower()
@@ -2034,8 +2057,8 @@ def upload_employees_excel():
                 category_mapped = 'Smart City'
             elif 'itms' in category_val_lower:
                 category_mapped = 'IITMS'
-            elif 'construction' in category_val_lower:
-                category_mapped = 'Construction'
+            elif 'towing' in category_val_lower or 'construction' in category_val_lower:
+                category_mapped = 'Towing'
             else:
                 category_mapped = category_val if category_val else None
 
@@ -2078,7 +2101,7 @@ def upload_employees_excel():
             {'id': 'ADMIN001', 'full_name': 'System Administrator', 'email': 'multisulotionsdecofurn@gmail.com', 'phone': '+919518791736', 'password': 'AD#987', 'category': None},
             {'id': 'smartcity_admin', 'full_name': 'Smart City Admin', 'email': 'smartcity@keltron.com', 'phone': '0000000001', 'password': 'SmartCity@Admin', 'category': 'Smart City'},
             {'id': 'iitms_admin', 'full_name': 'IITMS Admin', 'email': 'iitms@keltron.com', 'phone': '0000000002', 'password': 'IITMS@Admin', 'category': 'IITMS'},
-            {'id': 'construction_admin', 'full_name': 'Construction Admin', 'email': 'construction@keltron.com', 'phone': '0000000003', 'password': 'Construction@Admin', 'category': 'Construction'}
+            {'id': 'towing_admin', 'full_name': 'Towing Admin', 'email': 'towing@keltron.com', 'phone': '0000000003', 'password': 'Towing@Admin', 'category': 'Towing'}
         ]:
             if not Employee.query.get(adm['id']):
                 new_adm = Employee(
@@ -2278,6 +2301,14 @@ def junction_start():
 
     is_completed_immediately = (visit_type == 'Regular Visit' and asset_type == 'None')
 
+    now_utc = datetime.utcnow()
+    last_visit = JunctionVisit.query.filter_by(employee_id=employee_id, date=today).order_by(JunctionVisit.started_at.desc()).first()
+    prev_finish = (last_visit.completed_at or last_visit.started_at) if last_visit else (checked_in_today.check_in_time if checked_in_today else None)
+
+    calc_travel_mins = 0.0
+    if prev_finish and now_utc > prev_finish:
+        calc_travel_mins = round((now_utc - prev_finish).total_seconds() / 60.0, 1)
+
     visit = JunctionVisit(
         employee_id=employee_id,
         junction_name=junction_name.strip(),
@@ -2286,19 +2317,22 @@ def junction_start():
         date=today,
         before_photo=before_photo_filename,
         before_location=location,
-        started_at=datetime.utcnow(),
+        started_at=now_utc,
         status='completed' if is_completed_immediately else 'in_progress',
-        completed_at=datetime.utcnow() if is_completed_immediately else None,
+        completed_at=now_utc if is_completed_immediately else None,
         after_photo=before_photo_filename if is_completed_immediately else None,
         after_location=location if is_completed_immediately else None,
         remark='Regular Visit (No Fault)' if is_completed_immediately else None,
         before_remark=before_remark.strip() if before_remark else None,
         visit_type=visit_type,
         asset_type=asset_type,
-        fault_type=fault_type
+        fault_type=fault_type,
+        travel_time_minutes=calc_travel_mins,
+        time_spent_minutes=0.0 if is_completed_immediately else 0.0
     )
     db.session.add(visit)
     db.session.commit()
+
 
     return jsonify({
         'success': True,
@@ -2359,7 +2393,10 @@ def junction_complete(visit_id):
         visit.fault_type = request.form.get('fault_type')
     visit.completed_at = datetime.utcnow()
     visit.status = 'completed'
+    if visit.started_at:
+        visit.time_spent_minutes = round((visit.completed_at - visit.started_at).total_seconds() / 60.0, 1)
     db.session.commit()
+
 
     return jsonify({
         'success': True,
@@ -2561,6 +2598,8 @@ def junction_today(employee_id):
                 'fault_type': v.fault_type or '',
                 'remark': v.remark,
                 'before_remark': v.before_remark or '',
+                'time_spent_minutes': getattr(v, 'time_spent_minutes', 0.0) or (round((v.completed_at - v.started_at).total_seconds() / 60.0, 1) if (v.started_at and v.completed_at) else 0.0),
+                'travel_time_minutes': getattr(v, 'travel_time_minutes', 0.0) or 0.0,
                 'active_call_visit': {
                     'id': active_cv.id,
                     'before_photo': active_cv.before_photo,
@@ -2578,6 +2617,134 @@ def junction_today(employee_id):
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/location/ping', methods=['POST'])
+def receive_location_ping():
+    """Receives location pings from mobile/web clients during active official shift hours."""
+    try:
+        data = request.get_json(silent=True) or request.form
+        employee_id = data.get('employee_id')
+        lat = data.get('latitude') or data.get('lat')
+        lng = data.get('longitude') or data.get('lng')
+
+        if not employee_id or lat is None or lng is None:
+            return jsonify({'error': 'employee_id, latitude, longitude are required'}), 400
+
+        employee = Employee.query.get(employee_id)
+        if not employee:
+            return jsonify({'error': 'Employee not found'}), 404
+
+        today = datetime.utcnow().date()
+        attendance = Attendance.query.filter(
+            Attendance.employee_id == employee_id,
+            Attendance.date == today,
+            Attendance.check_in_time.isnot(None)
+        ).first()
+
+        if not attendance or attendance.check_out_time:
+            return jsonify({'success': False, 'message': 'Not in active shift'}), 200
+
+        ping = LocationPing(
+            employee_id=employee_id,
+            latitude=float(lat),
+            longitude=float(lng),
+            accuracy=float(data.get('accuracy')) if data.get('accuracy') else None,
+            speed=float(data.get('speed')) if data.get('speed') else None,
+            battery_level=float(data.get('battery_level')) if data.get('battery_level') else None,
+            timestamp=datetime.utcnow()
+        )
+        db.session.add(ping)
+        db.session.commit()
+
+        return jsonify({'success': True, 'message': 'Location ping logged'})
+    except Exception as e:
+        print("LOCATION PING ERROR:", e)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/employee/<employee_id>/timeline/today', methods=['GET'])
+def get_employee_today_timeline(employee_id):
+    """Returns today's movement timeline including visits, travel durations, and location pings."""
+    try:
+        today = datetime.utcnow().date()
+        employee = Employee.query.get(employee_id)
+        if not employee:
+            return jsonify({'error': 'Employee not found'}), 404
+
+        attendance = Attendance.query.filter_by(employee_id=employee_id, date=today).first()
+        check_in_ist = to_ist(attendance.check_in_time) if attendance and attendance.check_in_time else None
+        check_out_ist = to_ist(attendance.check_out_time) if attendance and attendance.check_out_time else None
+
+        visits = JunctionVisit.query.filter_by(employee_id=employee_id, date=today).order_by(JunctionVisit.started_at.asc()).all()
+
+        visit_list = []
+        prev_finish_time = attendance.check_in_time if attendance else None
+
+        for v in visits:
+            arrival_ist = to_ist(v.started_at) if v.started_at else None
+            completion_ist = to_ist(v.completed_at) if v.completed_at else None
+
+            time_spent_mins = getattr(v, 'time_spent_minutes', 0.0)
+            if not time_spent_mins or time_spent_mins == 0:
+                if v.started_at and v.completed_at:
+                    time_spent_mins = round((v.completed_at - v.started_at).total_seconds() / 60.0, 1)
+                elif v.started_at:
+                    time_spent_mins = round((datetime.utcnow() - v.started_at).total_seconds() / 60.0, 1)
+
+            travel_mins = getattr(v, 'travel_time_minutes', 0.0)
+            if not travel_mins or travel_mins == 0:
+                if prev_finish_time and v.started_at and v.started_at > prev_finish_time:
+                    travel_mins = round((v.started_at - prev_finish_time).total_seconds() / 60.0, 1)
+
+            if v.completed_at:
+                prev_finish_time = v.completed_at
+            elif v.started_at:
+                prev_finish_time = v.started_at
+
+            visit_list.append({
+                'id': v.id,
+                'junction_name': v.junction_name,
+                'ward': v.ward or '',
+                'zone': v.zone or '',
+                'visit_type': v.visit_type or 'Regular Visit',
+                'status': v.status,
+                'arrival_time': arrival_ist,
+                'completion_time': completion_ist,
+                'time_spent_minutes': time_spent_mins,
+                'travel_time_minutes': travel_mins,
+                'remark': v.remark or '',
+                'asset_type': v.asset_type or '',
+                'fault_type': v.fault_type or ''
+            })
+
+        pings = LocationPing.query.filter(
+            LocationPing.employee_id == employee_id,
+            db.func.date(LocationPing.timestamp) == today
+        ).order_by(LocationPing.timestamp.asc()).all()
+
+        ping_list = [{
+            'lat': p.latitude,
+            'lng': p.longitude,
+            'time': to_ist(p.timestamp) if p.timestamp else None,
+            'accuracy': p.accuracy
+        } for p in pings]
+
+        return jsonify({
+            'employee_id': employee_id,
+            'employee_name': employee.full_name,
+            'date': today.strftime('%Y-%m-%d'),
+            'check_in_time': check_in_ist,
+            'check_out_time': check_out_ist,
+            'total_visits': len(visits),
+            'visits': visit_list,
+            'location_pings_count': len(pings),
+            'pings': ping_list
+        })
+    except Exception as e:
+        print("TIMELINE ERROR:", e)
+        return jsonify({'error': str(e)}), 500
+
 
 
 @app.route('/api/junctions', methods=['GET'])
@@ -2894,7 +3061,7 @@ def download_junctions_sample_excel():
 
 @app.route('/api/admin/team/<team>/summary', methods=['GET'])
 def admin_team_summary(team):
-    """Top-line stats for one team's admin dashboard tab (COC / CCC / Field)."""
+    """Top-line stats for one team's admin dashboard tab (COC / CCC / Field / Towing)."""
     team = team.lower()
     date_str = request.args.get('date')
     if date_str:
@@ -2905,7 +3072,11 @@ def admin_team_summary(team):
     else:
         today = datetime.utcnow().date()
 
-    team_filter = Employee.team == team
+    if team == 'towing':
+        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+    else:
+        team_filter = Employee.team == team
+
     category = request.args.get('category')
 
     if category:
@@ -2925,7 +3096,7 @@ def admin_team_summary(team):
 
     junctions_today = 0
     active_junctions = 0
-    if member_ids and team in ('field', 'coc'):
+    if member_ids and team in ('field', 'coc', 'towing'):
         junctions_today = JunctionVisit.query.filter(
             JunctionVisit.employee_id.in_(member_ids),
             JunctionVisit.date == today
@@ -2959,7 +3130,11 @@ def admin_team_employees(team):
     else:
         today = datetime.utcnow().date()
 
-    team_filter = Employee.team == team
+    if team == 'towing':
+        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+    else:
+        team_filter = Employee.team == team
+
     category = request.args.get('category')
 
     if category:
@@ -2997,7 +3172,11 @@ def admin_team_junctions(team):
     end_date = request.args.get('end_date')
     employee_id = request.args.get('employee_id')
 
-    team_filter = Employee.team == team
+    if team == 'towing':
+        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+    else:
+        team_filter = Employee.team == team
+
     category = request.args.get('category')
 
     if employee_id:
@@ -3081,6 +3260,8 @@ def admin_team_junctions(team):
         'after_location': v.after_location,
         'started_at': to_ist(v.started_at),
         'completed_at': to_ist(v.completed_at),
+        'time_spent_minutes': getattr(v, 'time_spent_minutes', 0.0) or 0.0,
+        'travel_time_minutes': getattr(v, 'travel_time_minutes', 0.0) or 0.0,
         'status': v.status,
         'visit_type': v.visit_type,
         'asset_type': v.asset_type or '',
@@ -3102,6 +3283,215 @@ def admin_team_junctions(team):
     } for v, e in results])
 
 
+@app.route('/api/admin/field-activity-tracker', methods=['GET'])
+@app.route('/admin/field-activity-tracker', methods=['GET'])
+def admin_field_activity_tracker():
+    """Returns field team activity timeline grouped by employee & date for Field Activity Tracker UI."""
+    team = request.args.get('team', 'field').lower()
+    employee_id = request.args.get('employee_id')
+    date_str = request.args.get('date')
+    start_date_str = request.args.get('start_date')
+    end_date_str = request.args.get('end_date')
+    category = request.args.get('category')
+
+    if team == 'towing':
+        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+    else:
+        team_filter = Employee.team == team
+
+    if employee_id:
+        emps = Employee.query.filter(Employee.id == employee_id).all()
+    elif category:
+        emps = Employee.query.filter(team_filter, Employee.is_admin == False, Employee.category == category).all()
+    else:
+        emps = Employee.query.filter(team_filter, Employee.is_admin == False).all()
+
+    if not emps:
+        return jsonify([])
+
+    emp_ids = [e.id for e in emps]
+    emp_map = {e.id: e for e in emps}
+
+    s_date = None
+    e_date = None
+    if start_date_str and end_date_str:
+        try:
+            s_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            e_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+    elif date_str:
+        try:
+            target = datetime.strptime(date_str, '%Y-%m-%d').date()
+            s_date = target - timedelta(days=13)
+            e_date = target
+        except ValueError:
+            pass
+
+    if not s_date or not e_date:
+        today_val = datetime.now(pytz.UTC).astimezone(IST).date()
+        e_date = today_val
+        s_date = today_val - timedelta(days=13)
+
+    visits_q = JunctionVisit.query.filter(
+        JunctionVisit.employee_id.in_(emp_ids),
+        JunctionVisit.date >= s_date,
+        JunctionVisit.date <= e_date
+    ).order_by(JunctionVisit.date.desc(), JunctionVisit.started_at.asc()).all()
+
+    attendances_q = Attendance.query.filter(
+        Attendance.employee_id.in_(emp_ids),
+        Attendance.date >= s_date,
+        Attendance.date <= e_date,
+        Attendance.check_in_time.isnot(None)
+    ).all()
+
+    pings_q = LocationPing.query.filter(
+        LocationPing.employee_id.in_(emp_ids),
+        db.func.date(LocationPing.timestamp) >= s_date,
+        db.func.date(LocationPing.timestamp) <= e_date
+    ).order_by(LocationPing.timestamp.asc()).all()
+
+    emp_data = {}
+    for emp_id in emp_ids:
+        emp = emp_map[emp_id]
+        emp_data[emp_id] = {
+            'employee_id': emp.id,
+            'full_name': emp.full_name,
+            'team': emp.team or ('towing' if emp.category == 'Towing' else 'field'),
+            'designation': emp.designation or ('Towing Team' if emp.category == 'Towing' else 'Field Team'),
+            'daily_logs': {},
+            'pings': {}
+        }
+
+    for ping in pings_q:
+        if ping.employee_id in emp_data:
+            p_date_str = ping.timestamp.astimezone(IST).date().isoformat()
+            if p_date_str not in emp_data[ping.employee_id]['pings']:
+                emp_data[ping.employee_id]['pings'][p_date_str] = []
+            emp_data[ping.employee_id]['pings'][p_date_str].append(f"{ping.latitude},{ping.longitude}")
+
+    for att in attendances_q:
+        if att.employee_id in emp_data:
+            d_str = att.date.isoformat()
+            if d_str not in emp_data[att.employee_id]['daily_logs']:
+                emp_data[att.employee_id]['daily_logs'][d_str] = {
+                    'date': d_str,
+                    'check_in': None,
+                    'visits': []
+                }
+            emp_data[att.employee_id]['daily_logs'][d_str]['check_in'] = {
+                'time': to_ist(att.check_in_time),
+                'location': att.check_in_location
+            }
+
+    for v in visits_q:
+        if v.employee_id in emp_data:
+            d_str = v.date.isoformat()
+            if d_str not in emp_data[v.employee_id]['daily_logs']:
+                emp_data[v.employee_id]['daily_logs'][d_str] = {
+                    'date': d_str,
+                    'check_in': None,
+                    'visits': []
+                }
+            emp_data[v.employee_id]['daily_logs'][d_str]['visits'].append(v)
+
+    response_list = []
+    for emp_id in sorted(emp_data.keys()):
+        e_info = emp_data[emp_id]
+        daily_logs_list = []
+        total_visits_count = 0
+        total_site_mins = 0.0
+        total_gap_mins = 0.0
+        all_stops_coords = []
+
+        sorted_dates = sorted(e_info['daily_logs'].keys(), reverse=True)
+        for d_str in sorted_dates:
+            day_log = e_info['daily_logs'][d_str]
+            visits = day_log['visits']
+            check_in = day_log['check_in']
+            day_pings = e_info['pings'].get(d_str, [])
+
+            if not check_in and not visits and not day_pings:
+                continue
+
+            day_visits_count = len(visits)
+            total_visits_count += day_visits_count
+
+            day_site_mins = 0.0
+            day_gap_mins = 0.0
+            events = []
+
+            if check_in:
+                events.append({
+                    'type': 'check_in',
+                    'time': check_in['time'],
+                    'location': check_in['location']
+                })
+                if check_in['location']:
+                    all_stops_coords.append(check_in['location'])
+
+            # Add background location pings as intermediate stops
+            for ping_loc in day_pings:
+                if ping_loc not in all_stops_coords:
+                    all_stops_coords.append(ping_loc)
+
+            for v in visits:
+                site_m = getattr(v, 'time_spent_minutes', 0.0) or 0.0
+                gap_m = getattr(v, 'travel_time_minutes', 0.0) or 0.0
+                day_site_mins += site_m
+                day_gap_mins += gap_m
+
+                loc_coord = v.before_location or v.after_location
+                if loc_coord and loc_coord not in all_stops_coords:
+                    all_stops_coords.append(loc_coord)
+
+                events.append({
+                    'type': 'visit',
+                    'id': v.id,
+                    'junction_name': v.junction_name,
+                    'visit_type': v.visit_type or 'Regular Visit',
+                    'ward': v.ward or '',
+                    'zone': v.zone or '',
+                    'started_at': to_ist(v.started_at),
+                    'completed_at': to_ist(v.completed_at),
+                    'status': v.status,
+                    'time_spent_minutes': round(site_m, 1),
+                    'travel_time_minutes': round(gap_m, 1),
+                    'before_location': v.before_location,
+                    'after_location': v.after_location,
+                    'remark': v.remark or '',
+                    'before_remark': v.before_remark or ''
+                })
+
+            total_site_mins += day_site_mins
+            total_gap_mins += day_gap_mins
+
+            daily_logs_list.append({
+                'date': d_str,
+                'visits_count': day_visits_count,
+                'site_mins': round(day_site_mins, 1),
+                'gap_mins': round(day_gap_mins, 1),
+                'events': events,
+                'stops_count': len([ev for ev in events if ev.get('location') or ev.get('before_location')]) + len(day_pings)
+            })
+
+        response_list.append({
+            'employee_id': e_info['employee_id'],
+            'full_name': e_info['full_name'],
+            'team': e_info['team'],
+            'designation': e_info['designation'],
+            'active_days': len(daily_logs_list),
+            'junctions_visited': total_visits_count,
+            'total_time_on_site': round(total_site_mins, 1),
+            'total_gap_travel_time': round(total_gap_mins, 1),
+            'stops_coords': all_stops_coords,
+            'daily_logs': daily_logs_list
+        })
+
+    return jsonify(response_list)
+
+
 @app.route('/api/admin/team/<team>/junctions/export', methods=['GET'])
 def admin_team_junctions_export(team):
     """Export junction visit log to Excel for a specific team, date or date range, and employee."""
@@ -3110,7 +3500,12 @@ def admin_team_junctions_export(team):
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
     employee_id = request.args.get('employee_id')
-    team_filter = Employee.team == team
+    
+    if team == 'towing':
+        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+    else:
+        team_filter = Employee.team == team
+
     category = request.args.get('category')
 
     if employee_id:
@@ -3212,6 +3607,17 @@ def admin_team_junctions_export(team):
             if group_size > 1:
                 merge_ranges.append((start_excel_row, end_excel_row))
                 
+            # Calculate duration spent at junction
+            time_spent_str = '—'
+            if v.completed_at and v.started_at:
+                time_spent_str = f"{round((v.completed_at - v.started_at).total_seconds() / 60.0, 1)} mins"
+            elif v.started_at:
+                time_spent_str = 'In Progress'
+
+            arr_time_str = utc_to_ist_dt(v.started_at).strftime('%I:%M:%S %p') if v.started_at else '—'
+            comp_time_str = utc_to_ist_dt(v.completed_at).strftime('%I:%M:%S %p') if (v.status == 'completed' and v.completed_at) else '—'
+            travel_time_str = f"{getattr(v, 'travel_time_minutes', 0.0) or 0.0} mins"
+
             # Append parent row
             main_visit_date = v.date.strftime('%d-%m-%Y') if v.date else '—'
             data.append({
@@ -3223,6 +3629,10 @@ def admin_team_junctions_export(team):
                 'Ward': v.ward or '',
                 'Zone': v.zone or '',
                 'Visit Date': main_visit_date,
+                'Arrival Time (IST)': arr_time_str,
+                'Completion Time (IST)': comp_time_str,
+                'Time Spent at Junction': time_spent_str,
+                'Travel Time to Reach': travel_time_str,
                 'Started At (IST)': started_ist,
                 'Completed At (IST)': completed_ist,
                 'Status': 'Completed' if v.status == 'completed' else ('Unresolved' if v.status == 'unresolved' else 'Open'),
@@ -3249,6 +3659,7 @@ def admin_team_junctions_export(team):
             for cv in sorted(v.call_visits, key=lambda x: x.id):
                 cv_started_date = utc_to_ist_dt(cv.started_at).strftime('%d-%m-%Y') if cv.started_at else '—'
                 cv_started_time = utc_to_ist_dt(cv.started_at).strftime('%Y-%m-%d %H:%M:%S') if cv.started_at else '—'
+                cv_arr_time = utc_to_ist_dt(cv.started_at).strftime('%I:%M:%S %p') if cv.started_at else '—'
                 
                 data.append({
                     'Employee ID': v.employee_id,
@@ -3259,6 +3670,10 @@ def admin_team_junctions_export(team):
                     'Ward': v.ward or '',
                     'Zone': v.zone or '',
                     'Visit Date': cv_started_date,
+                    'Arrival Time (IST)': cv_arr_time,
+                    'Completion Time (IST)': comp_time_str,
+                    'Time Spent at Junction': time_spent_str,
+                    'Travel Time to Reach': travel_time_str,
                     'Started At (IST)': cv_started_time,
                     'Completed At (IST)': completed_ist,
                     'Status': 'Completed' if v.status == 'completed' else ('Unresolved' if v.status == 'unresolved' else 'Open'),
@@ -3271,6 +3686,7 @@ def admin_team_junctions_export(team):
                     'Before Remark': cv.before_remark or '—',
                     'Remark': main_remark
                 })
+
                 
                 image_map.append({
                     'row_idx': row_counter,
@@ -3533,10 +3949,35 @@ def auto_migrate_db():
     """Automatically detects missing columns in MySQL tables based on SQLAlchemy models and adds them."""
     from sqlalchemy import inspect, text
     try:
+        # Ensure location_ping table exists directly without metadata inspection conflict
+        create_ping_sql = """
+        CREATE TABLE IF NOT EXISTS `location_ping` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `employee_id` VARCHAR(50) NOT NULL,
+            `latitude` FLOAT NOT NULL,
+            `longitude` FLOAT NOT NULL,
+            `accuracy` FLOAT NULL,
+            `speed` FLOAT NULL,
+            `battery_level` FLOAT NULL,
+            `timestamp` DATETIME DEFAULT CURRENT_TIMESTAMP,
+            `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX `idx_loc_ping_time` (`timestamp`),
+            INDEX `idx_loc_ping_emp` (`employee_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+        """
+        try:
+            db.session.execute(text(create_ping_sql))
+            db.session.commit()
+        except Exception as p_err:
+            db.session.rollback()
+
         inspector = inspect(db.engine)
         for model in db.Model.__subclasses__():
             if hasattr(model, '__table__'):
                 table_name = model.__table__.name
+                if table_name == 'location_ping':
+                    continue
                 if inspector.has_table(table_name):
                     existing_cols = {col['name'] for col in inspector.get_columns(table_name)}
                     for column in model.__table__.columns:
@@ -3560,9 +4001,14 @@ def auto_migrate_db():
 
 if __name__ == "__main__":
     with app.app_context():
-        # Create tables & auto-migrate missing columns
-        db.create_all()
+        # Create tables & auto-migrate missing columns cleanly
+        try:
+            target_tables = [t for t in db.metadata.sorted_tables if t.name != 'location_ping']
+            db.metadata.create_all(bind=db.engine, tables=target_tables)
+        except Exception as err:
+            print(f"db.create_all() notice: {err}")
         auto_migrate_db()
+
 
     # Create default admin if no admin exists
         if not Employee.query.filter_by(is_admin=True).first():

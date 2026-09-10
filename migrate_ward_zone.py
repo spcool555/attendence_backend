@@ -9,13 +9,13 @@ import os
 
 load_dotenv()
 
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_USER = os.getenv('DB_USER', 'root')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'Harsha@27')
+DB_HOST = os.getenv('DB_HOST', '31.97.224.19')
+DB_USER = os.getenv('DB_USER', 'spcool')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'Spcool@123')
 DB_PORT = int(os.getenv('DB_PORT', '3306'))
-DB_NAME = os.getenv('DB_NAME', 'attendance_db')
+DB_NAME = os.getenv('DB_NAME', 'decofurn')
 
-conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, port=DB_PORT, database=DB_NAME)
+conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD,port=DB_PORT, database=DB_NAME)
 cursor = conn.cursor()
 
 def add_col_if_missing(table, col, col_def):

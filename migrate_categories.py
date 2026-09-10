@@ -12,7 +12,7 @@ DB_PORT = int(os.getenv('DB_PORT', '3306'))
 DB_NAME = os.getenv('DB_NAME', 'decofurn')
 
 print("Connecting to DB...")
-conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, port=DB_PORT, database=DB_NAME)
+conn = pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD,port=DB_PORT,database=DB_NAME)
 cursor = conn.cursor()
 
 # 1. Add category column if missing
@@ -50,13 +50,13 @@ admins_to_create = [
         'category': 'IITMS'
     },
     {
-        'id': 'construction_admin',
-        'full_name': 'Construction Admin',
-        'email': 'construction@keltron.com',
+        'id': 'towing_admin',
+        'full_name': 'Towing Admin',
+        'email': 'towing@keltron.com',
         'phone': '0000000003',
-        'password': 'Construction@Admin',
+        'password': 'Towing@Admin',
         'is_admin': 1,
-        'category': 'Construction'
+        'category': 'Towing'
     }
 ]
 

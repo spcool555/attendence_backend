@@ -4,11 +4,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_USER = os.getenv('DB_USER', 'root')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'Harsha@27')
+DB_HOST = os.getenv('DB_HOST', '31.97.224.19')
+DB_USER = os.getenv('DB_USER', 'spcool')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'Spcool@123')
 DB_PORT = int(os.getenv('DB_PORT', '3306'))
-DB_NAME = os.getenv('DB_NAME', 'attendance_db')
+DB_NAME = os.getenv('DB_NAME', 'decofurn')
 
 def migrate():
     print(f"Connecting to {DB_USER}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
@@ -17,7 +17,6 @@ def migrate():
             host=DB_HOST,
             user=DB_USER,
             password=DB_PASSWORD,
-            port=DB_PORT,
             database=DB_NAME
         )
         cursor = conn.cursor()

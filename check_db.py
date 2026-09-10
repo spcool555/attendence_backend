@@ -7,6 +7,7 @@ conn = pymysql.connect(
     host=os.getenv('DB_HOST', '31.97.224.19'),
     user=os.getenv('DB_USER', 'spcool'),
     password=os.getenv('DB_PASSWORD', 'Spcool@123'),
+    port=int(os.getenv('DB_PORT', '3306')),
     database=os.getenv('DB_NAME', 'decofurn')
 )
 cur = conn.cursor()
