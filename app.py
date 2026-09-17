@@ -15,9 +15,19 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 #from twilio.rest import Client
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, func
 from datetime import date
 from calendar import monthrange
+
+def sanitize_category(cat_val):
+    if not cat_val:
+        return None
+    s = str(cat_val).strip()
+    if ':' in s:
+        s = s.split(':')[0].strip()
+    if s.lower() in ('', 'null', 'undefined', 'none', 'all'):
+        return None
+    return s
 
 # ADD / UPDATE THIS (top of file ya helper section me)
 SUPPORTED_LANGUAGES = [
@@ -167,6 +177,7 @@ CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # Database Models
 class Employee(db.Model):
+    __tablename__ = 'employee'
     id = db.Column(db.String(50), primary_key=True)
     full_name = db.Column(db.String(100), nullable=False)
     email = db.Column(db.String(100), unique=True, nullable=False)
@@ -186,11 +197,13 @@ class Employee(db.Model):
     team = db.Column(db.String(20))
     designation = db.Column(db.String(100))
     category = db.Column(db.String(50))
+    project = db.Column(db.String(50), default='Smart City')
 
     # Relationship with attendance records
     attendance_records = db.relationship('Attendance', backref='employee', lazy=True)
 
 class Attendance(db.Model):
+    __tablename__ = 'attendance'
     id = db.Column(db.Integer, primary_key=True)
     employee_id = db.Column(db.String(50), db.ForeignKey('employee.id'), nullable=False)
     date = db.Column(db.Date, nullable=False)
@@ -207,6 +220,7 @@ class Attendance(db.Model):
     shift_type = db.Column(db.String(20))
     
 class Leave(db.Model):
+    __tablename__ = 'leave'
     id = db.Column(db.Integer, primary_key=True)
     employee_id = db.Column(db.String(50), db.ForeignKey('employee.id'), nullable=False)
     leave_type = db.Column(db.String(20), nullable=False)  # 'sick', 'emergency', 'Compensatory_off', 'lwp'
@@ -225,6 +239,7 @@ class Leave(db.Model):
     employee = db.relationship('Employee', backref='leaves')
     
 class Announcement(db.Model):
+    __tablename__ = 'announcement'
     id = db.Column(db.Integer, primary_key=True)
     message = db.Column(db.Text, nullable=False)
     created_by = db.Column(db.String(50), db.ForeignKey('employee.id'))
@@ -360,23 +375,29 @@ def notify_employee_leave_status(employee, leave):
 # Authentication Routes
 @app.route('/api/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    employee_id = data.get('employee_id')
-    password = data.get('password')
+    data = request.get_json() or {}
+    raw_id = data.get('employee_id')
+    raw_pass = data.get('password')
 
-    if not employee_id or not password:
+    if not raw_id or not raw_pass:
         return jsonify({'error': 'Employee ID and password are required'}), 400
 
-    # Retrieve employee record without password filter
-    employee = Employee.query.filter_by(id=employee_id).first()
+    employee_id = str(raw_id).strip()
+    password = str(raw_pass).strip()
+
+    # Retrieve employee record case-insensitively
+    employee = Employee.query.filter(func.lower(Employee.id) == employee_id.lower()).first()
 
     if not employee:
         return jsonify({'error': 'Invalid credentials'}), 401
 
-    # Admin authentication: check stored employee password or ADMIN_PASSWORD env variable
+    # Master admin password fallback (from ADMIN001 password or ADMIN_PASSWORD env)
+    admin001 = Employee.query.filter(func.lower(Employee.id) == 'admin001').first()
+    master_pass = os.getenv('ADMIN_PASSWORD') or (admin001.password if admin001 else 'AD#987')
+
+    # Admin authentication: check stored employee password or master_pass
     if employee.is_admin:
-        admin_pass = os.getenv('ADMIN_PASSWORD')
-        if employee.password == password or (admin_pass and password == admin_pass):
+        if employee.password == password or password == master_pass:
             return jsonify({
                 'success': True,
                 'employee': {
@@ -718,11 +739,14 @@ def get_attendance_status(employee_id):
 # Admin Routes
 @app.route('/api/admin/employees', methods=['GET'])
 def get_employees():
-    category = request.args.get('category')
-    if category:
-        employees = Employee.query.filter_by(category=category).all()
-    else:
-        employees = Employee.query.all()
+    category = sanitize_category(request.args.get('category'))
+    project = sanitize_category(request.args.get('project'))
+    query = Employee.query
+    if project:
+        query = query.filter(or_(func.lower(Employee.project) == project.lower(), func.lower(Employee.category) == project.lower()))
+    elif category:
+        query = query.filter(func.lower(Employee.category) == category.lower())
+    employees = query.all()
     return jsonify([{
         'id': emp.id,
         'full_name': emp.full_name,
@@ -732,6 +756,7 @@ def get_employees():
         'team': emp.team,
         'designation': emp.designation,
         'category': emp.category,
+        'project': emp.project or emp.category or 'Smart City',
         'created_at': emp.created_at.isoformat()
     } for emp in employees])
 
@@ -752,19 +777,27 @@ def create_employee():
     if Employee.query.filter_by(email=data['email']).first():
         return jsonify({'error': 'Email already exists'}), 400
     
-    # Map designation to team
+    project_val = data.get('project') or data.get('category') or 'Smart City'
+    category_val = data.get('category') or project_val
+
+    # Map designation or explicit team
     designation = data.get('designation', '')
+    explicit_team = data.get('team', '')
     team_mapped = None
-    if designation:
+    if explicit_team:
+        t_low = explicit_team.lower()
+        if 'field' in t_low: team_mapped = 'field'
+        elif 'coc' in t_low: team_mapped = 'coc'
+        elif 'ccc' in t_low: team_mapped = 'ccc'
+        elif 'towing' in t_low: team_mapped = 'towing'
+        elif 'headoffice' in t_low or 'head office' in t_low: team_mapped = 'headoffice'
+    if not team_mapped and designation:
         desig_lower = designation.lower()
-        if 'field' in desig_lower:
-            team_mapped = 'field'
-        elif 'coc' in desig_lower or 'cooc' in desig_lower:
-            team_mapped = 'coc'
-        elif 'ccc' in desig_lower:
-            team_mapped = 'ccc'
-        elif 'towing' in desig_lower:
-            team_mapped = 'towing'
+        if 'field' in desig_lower: team_mapped = 'field'
+        elif 'coc' in desig_lower or 'cooc' in desig_lower: team_mapped = 'coc'
+        elif 'ccc' in desig_lower: team_mapped = 'ccc'
+        elif 'towing' in desig_lower: team_mapped = 'towing'
+        elif 'headoffice' in desig_lower or 'head office' in desig_lower: team_mapped = 'headoffice'
             
     employee = Employee(
         id=data['id'],
@@ -775,10 +808,11 @@ def create_employee():
         is_admin=data.get('is_admin', False),
         shift_type=data.get('shift_type', 'general'),
         weekly_off=data.get('weekly_off') or 'Sunday',
-        category=data.get('category'),
+        project=project_val,
+        category=category_val,
         designation=designation,
         team=team_mapped
-        )
+    )
     
     db.session.add(employee)
     db.session.commit()
@@ -793,6 +827,7 @@ def create_employee():
             'phone': employee.phone,
             'is_admin': employee.is_admin,
             'category': employee.category,
+            'project': employee.project,
             'designation': employee.designation,
             'team': employee.team
         }
@@ -803,12 +838,12 @@ def get_attendance_logs():
     employee_id = request.args.get('employee_id')
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
     
     query = db.session.query(Attendance, Employee).join(Employee)
     
     if category:
-        query = query.filter(Employee.category == category)
+        query = query.filter(func.lower(Employee.category) == category.lower())
         
     if employee_id:
         query = query.filter(Attendance.employee_id == employee_id)
@@ -847,12 +882,12 @@ def export_attendance():
     employee_id = request.args.get('employee_id')
     start_date = request.args.get('start_date')
     end_date = request.args.get('end_date')
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
     
     query = db.session.query(Attendance, Employee).join(Employee)
     
     if category:
-        query = query.filter(Employee.category == category)
+        query = query.filter(func.lower(Employee.category) == category.lower())
         
     if employee_id:
         query = query.filter(Attendance.employee_id == employee_id)
@@ -913,7 +948,7 @@ def export_attendance():
 @app.route('/api/admin/stats', methods=['GET'])
 def get_attendance_stats():
     today = date.today()
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
     
     # Get today's attendance stats
     today_stats_query = db.session.query(Attendance.status, db.func.count(Attendance.id)).join(Employee).filter(
@@ -921,7 +956,7 @@ def get_attendance_stats():
         Employee.is_admin == False
     )
     if category:
-        today_stats_query = today_stats_query.filter(Employee.category == category)
+        today_stats_query = today_stats_query.filter(func.lower(Employee.category) == category.lower())
         
     today_stats = today_stats_query.group_by(Attendance.status).all()
     
@@ -940,7 +975,7 @@ def get_attendance_stats():
     # Calculate absent count (employees who didn't check in)
     total_employees_query = Employee.query.filter_by(is_admin=0)
     if category:
-        total_employees_query = total_employees_query.filter_by(category=category)
+        total_employees_query = total_employees_query.filter(func.lower(Employee.category) == category.lower())
     total_employees = total_employees_query.count()
     
     checked_in_today_query = Attendance.query.join(Employee).filter(
@@ -949,7 +984,7 @@ def get_attendance_stats():
         Employee.is_admin == 0
     )
     if category:
-        checked_in_today_query = checked_in_today_query.filter(Employee.category == category)
+        checked_in_today_query = checked_in_today_query.filter(func.lower(Employee.category) == category.lower())
     checked_in_today = checked_in_today_query.count()
     
     stats['absent'] = total_employees - checked_in_today
@@ -1282,9 +1317,17 @@ def get_all_leaves():
                 pending_count += 1
                 pending_days += d_count
 
-        total_sick = 8
-        total_emergency = 8
-        total_comp = 8
+        total_sick = 8.0
+        total_emergency = 8.0
+        total_comp = 8.0
+        total_allowed = total_sick + total_emergency + total_comp
+        used_paid = sick_used + emergency_used + comp_used
+        used_lwp = lwp_used
+
+        sick_rem = max(0.0, total_sick - sick_used)
+        emerg_rem = max(0.0, total_emergency - emergency_used)
+        comp_rem = max(0.0, total_comp - comp_used)
+        total_rem = sick_rem + emerg_rem + comp_rem
 
         stats = {
             'approved_days_taken': approved_days,
@@ -1294,20 +1337,23 @@ def get_all_leaves():
             'emergency_used': emergency_used,
             'comp_used': comp_used,
             'lwp_used': lwp_used,
-            'sick_remaining': max(0, total_sick - sick_used),
-            'emergency_remaining': max(0, total_emergency - emergency_used),
-            'comp_remaining': max(0, total_comp - comp_used),
-            'total_remaining': max(0, total_sick - sick_used) + max(0, total_emergency - emergency_used) + max(0, total_comp - comp_used)
+            'total_allowed': total_allowed,
+            'used_paid_leaves': used_paid,
+            'remaining_paid_leaves': total_rem,
+            'used_unpaid_leaves': used_lwp,
+            'total_remaining': total_rem,
+            'sick_remaining': sick_rem,
+            'emergency_remaining': emerg_rem,
+            'comp_remaining': comp_rem
         }
         emp_stats_cache[emp_id] = stats
         return stats
 
     leaves = []
     for leave, employee in results:
-        # Safe attribute access for backward compatibility
         is_half_day = getattr(leave, 'is_half_day', False)
-        half_day_period = getattr(leave, 'half_day_period', None)
-        
+        days_count = 0.5 if is_half_day else (leave.end_date - leave.start_date).days + 1
+        emp_stats = get_emp_stats(leave.employee_id)
         leaves.append({
             'id': leave.id,
             'employee_id': leave.employee_id,
@@ -1317,22 +1363,28 @@ def get_all_leaves():
             'leave_type': leave.leave_type,
             'start_date': leave.start_date.isoformat(),
             'end_date': leave.end_date.isoformat(),
+            'days_count': days_count,
             'reason': leave.reason,
             'status': leave.status,
             'admin_comment': leave.admin_comment,
             'is_half_day': is_half_day,
-            'half_day_period': half_day_period,
+            'half_day_period': getattr(leave, 'half_day_period', None),
             'supporting_document': getattr(leave, 'supporting_document', None),
             'created_at': to_ist(leave.created_at),
-            'days_count': 0.5 if is_half_day else (leave.end_date - leave.start_date).days + 1,
-            'employee_stats': get_emp_stats(leave.employee_id)
+            'updated_at': to_ist(leave.updated_at) if leave.updated_at else to_ist(leave.created_at),
+            'total_allowed_leaves': emp_stats['total_allowed'],
+            'used_paid_leaves': emp_stats['used_paid_leaves'],
+            'remaining_paid_leaves': emp_stats['remaining_paid_leaves'],
+            'used_unpaid_leaves': emp_stats['used_unpaid_leaves'],
+            'employee_stats': emp_stats
         })
     
     return jsonify(leaves)
+
 @app.route('/api/admin/employees-by-status', methods=['GET'])
 def get_employees_by_status():
     status = request.args.get('status')
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
     today = date.today()
 
     if status == 'absent':
@@ -1341,23 +1393,23 @@ def get_employees_by_status():
             Attendance.date == today
         )
         if category:
-            checked_ids_query = checked_ids_query.join(Employee).filter(Employee.category == category)
+            checked_ids_query = checked_ids_query.join(Employee).filter(func.lower(Employee.category) == category.lower())
             
         checked_ids = checked_ids_query
         query = db.session.query(Employee.id, Employee.full_name).filter(
             ~Employee.id.in_(checked_ids),
-            Employee.is_admin == False
+            or_(Employee.is_admin == False, Employee.is_admin.is_(None))
         )
         if category:
-            query = query.filter(Employee.category == category)
+            query = query.filter(func.lower(Employee.category) == category.lower())
     else:
         # Join Attendance + Employee
         query = db.session.query(Employee.id, Employee.full_name).join(Attendance).filter(
             Attendance.date == today,
-            Employee.is_admin == False
+            or_(Employee.is_admin == False, Employee.is_admin.is_(None))
         )
         if category:
-            query = query.filter(Employee.category == category)
+            query = query.filter(func.lower(Employee.category) == category.lower())
             
         # Status filter (distinct employees — multiple shifts today can duplicate rows)
         if status == 'present':
@@ -1668,10 +1720,13 @@ def delete_announcement(id):
 
 class JunctionList(db.Model):
     """Stores the list of predefined junction names uploaded via Excel (Field team - legacy)."""
+    __tablename__ = 'junction_list'
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(150), unique=True, nullable=False)
+    name = db.Column(db.String(150), nullable=False)
     ward = db.Column(db.String(100), nullable=True)
     zone = db.Column(db.String(100), nullable=True)
+    category = db.Column(db.String(50), nullable=True, default='Smart City')
+    project = db.Column(db.String(50), nullable=True, default='Smart City')
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
 
 
@@ -1684,14 +1739,16 @@ class LocationList(db.Model):
     team = db.Column(db.String(20), nullable=False)  # 'field' | 'coc' | 'ccc'
     ward = db.Column(db.String(100), nullable=True)
     zone = db.Column(db.String(100), nullable=True)
+    category = db.Column(db.String(50), nullable=True, default='Smart City')
+    project = db.Column(db.String(50), nullable=True, default='Smart City')
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(pytz.UTC))
-    __table_args__ = (db.UniqueConstraint('name', 'team', name='uq_location_name_team'),)
 
 
 class JunctionVisit(db.Model):
     """A single junction/site visit made by a roaming (Field/COC/CCC) employee
     during their shift. 'Before' photo + location are captured on arrival,
     'After' photo + location are captured when the visit is completed."""
+    __tablename__ = 'junction_visit'
     id = db.Column(db.Integer, primary_key=True)
     employee_id = db.Column(db.String(50), db.ForeignKey('employee.id'), nullable=False)
     junction_name = db.Column(db.String(150), nullable=False)
@@ -1797,15 +1854,26 @@ def get_locations():
     Query param: ?team=field|coc|ccc|towing
     Falls back to JunctionList (legacy) for field & towing teams if LocationList is empty."""
     team = (request.args.get('team') or 'field').lower()
+    category = sanitize_category(request.args.get('category') or request.args.get('project'))
 
     if team not in ALLOWED_VISIT_TEAMS:
         return jsonify({'error': 'Invalid team. Must be field, coc, ccc, or towing'}), 400
 
     if team in ('field', 'towing'):
-        locations = JunctionList.query.order_by(JunctionList.name.asc()).all()
+        query = JunctionList.query
+        if category:
+            query = query.filter(or_(func.lower(JunctionList.category) == category.lower(), func.lower(JunctionList.project) == category.lower(), JunctionList.category.is_(None)))
+        locations = query.order_by(JunctionList.name.asc()).all()
+        if not locations and category:
+            locations = JunctionList.query.order_by(JunctionList.name.asc()).all()
         return jsonify([{'id': loc.id, 'name': loc.name, 'ward': loc.ward or '', 'zone': loc.zone or ''} for loc in locations])
 
-    locations = LocationList.query.filter_by(team=team).order_by(LocationList.name.asc()).all()
+    query = LocationList.query.filter_by(team=team)
+    if category:
+        query = query.filter(or_(func.lower(LocationList.category) == category.lower(), func.lower(LocationList.project) == category.lower(), LocationList.category.is_(None)))
+    locations = query.order_by(LocationList.name.asc()).all()
+    if not locations and category:
+        locations = LocationList.query.filter_by(team=team).order_by(LocationList.name.asc()).all()
     return jsonify([{'id': loc.id, 'name': loc.name, 'ward': loc.ward or '', 'zone': loc.zone or ''} for loc in locations])
 
 
@@ -1942,15 +2010,19 @@ def upload_locations_excel():
 
 @app.route('/api/admin/employees/sample', methods=['GET'])
 def download_employees_sample_excel():
-    """Download a sample Excel file for Employee upload."""
+    """Download a sample Excel file for Employee upload with Team and Project fields."""
     data = {
-        'Employee ID': ['EMP001', 'EMP002', 'EMP003'],
-        'Full Name': ['Snehal Patil', 'Amit Sharma', 'Priya Nair'],
-        'Email': ['snehal@example.com', 'amit@example.com', 'priya@example.com'],
-        'Phone': ['9876543210', '9876543211', '9876543212'],
-        'Password': ['pass123', 'pass456', 'pass789'],
-        'Team': ['Field Team', 'CoC', 'CCC'],
-        'Category': ['Smart City', 'IITMS', 'Towing']
+        'Employee ID': ['EMP1001', 'EMP1002', 'EMP1003', 'EMP1004', 'EMP1005'],
+        'Full Name': ['Rahul Sharma', 'Priya Patel', 'Amit Verma', 'Sneha Kapoor', 'Vikram Singh'],
+        'Email': ['rahul.sharma@example.com', 'priya.patel@example.com', 'amit.verma@example.com', 'sneha.kapoor@example.com', 'vikram.singh@example.com'],
+        'Phone': ['9876543210', '9876543211', '9876543212', '9876543213', '9876543214'],
+        'Password': ['Emp@123', 'Emp@123', 'Emp@123', 'Emp@123', 'Emp@123'],
+        'Team': ['Field Team', 'COC', 'CCC', 'Towing', 'Head Office'],
+        'Project': ['Smart City', 'IITMS', 'Smart City', 'Towing', 'Head Office'],
+        'Designation': ['Field Engineer', 'COC Operator', 'CCC Supervisor', 'Towing Executive', 'Head Office Manager'],
+        'Category': ['Smart City', 'IITMS', 'Smart City', 'Towing', 'Head Office'],
+        'Shift Type': ['general', 'general', 'general', 'general', 'general'],
+        'Weekly Off': ['Sunday', 'Sunday', 'Sunday', 'Sunday', 'Sunday']
     }
     df = pd.DataFrame(data)
     output = BytesIO()
@@ -1965,168 +2037,128 @@ def download_employees_sample_excel():
 
 @app.route('/api/admin/employees/upload', methods=['POST'])
 def upload_employees_excel():
-    """Upload an Excel file to register or update employees."""
+    """Admin uploads an Excel file to bulk create/update employees with Project & Team."""
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
-
     file = request.files['file']
     if not file or not (file.filename.endswith('.xlsx') or file.filename.endswith('.xls') or file.filename.endswith('.csv')):
-        return jsonify({'error': 'Invalid file format. Please upload an Excel (.xlsx/.xls) or CSV file.'}), 400
-
+        return jsonify({'error': 'Invalid file format. Please upload an Excel or CSV file.'}), 400
+    
     try:
         if file.filename.endswith('.csv'):
-            df = pd.read_csv(file, dtype=str)
+            df = pd.read_csv(file, dtype=str, keep_default_na=False)
         else:
-            df = pd.read_excel(file, dtype=str)
+            df = pd.read_excel(file, dtype=str, keep_default_na=False)
 
-        # Normalize column names (strip spaces)
-        df.columns = [c.strip() for c in df.columns]
+        col_clean_map = {str(c).strip().lower(): c for c in df.columns}
 
-        # Check for Team/Designation column
-        desig_col = None
-        for candidate in ['Team', 'team', 'TEAM', 'Designation', 'designation', 'DESIGNATION']:
-            if candidate in df.columns:
-                desig_col = candidate
-                break
-        if not desig_col:
-            return jsonify({'error': 'Missing Designation/Team column. File must have a "Team" or "Designation" column.'}), 400
+        def match_col(candidates):
+            for cand in candidates:
+                if cand.lower() in col_clean_map:
+                    return col_clean_map[cand.lower()]
+            return None
 
-        # Check required columns
-        required_cols = ['Employee ID', 'Full Name', 'Email', 'Phone', 'Password']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            return jsonify({'error': f'Missing columns: {", ".join(missing_cols)}'}), 400
+        id_col = match_col(['employee id', 'employee_id', 'id', 'emp id', 'empid'])
+        name_col = match_col(['full name', 'full_name', 'name', 'employee name'])
+        email_col = match_col(['email', 'email address', 'email_address'])
+        phone_col = match_col(['phone', 'phone number', 'mobile', 'contact'])
+        password_col = match_col(['password', 'pass'])
+        team_col = match_col(['team', 'team name', 'department'])
+        project_col = match_col(['project', 'project name', 'project_name'])
+        desig_col = match_col(['designation', 'role', 'title'])
+        cat_col = match_col(['category', 'cat'])
+        shift_col = match_col(['shift type', 'shift_type', 'shift'])
+        off_col = match_col(['weekly off', 'weekly_off', 'off day'])
 
-        # Check for Category/Group column
-        group_col = None
-        for candidate in ['Category', 'category', 'Group', 'group', 'GROUP', 'CATEGORY']:
-            if candidate in df.columns:
-                group_col = candidate
-                break
-        if not group_col:
-            return jsonify({'error': 'Missing Category/Group column. File must have a "Category" or "Group" column.'}), 400
-
-        def clean_val(val):
-            if pd.isna(val):
-                return ''
-            s = str(val).strip()
-            if s.endswith('.0'):
-                s = s[:-2]
-            return s
-
-        # Process spreadsheet rows to add or update employees
+        if not id_col or not name_col:
+            return jsonify({'error': 'Missing required columns ("Employee ID", "Full Name") in the uploaded file.'}), 400
 
         added_count = 0
         updated_count = 0
 
-        for index, row in df.iterrows():
-            emp_id = clean_val(row['Employee ID'])
-            if not emp_id or emp_id.lower() == 'nan':
-                continue # Skip empty rows
+        for _, row in df.iterrows():
+            emp_id = str(row[id_col]).strip()
+            name = str(row[name_col]).strip()
+            if not emp_id or not name or emp_id.lower() == 'nan':
+                continue
 
-            if emp_id.isdigit():
-                emp_id = f"EMP{int(emp_id):03d}"
-            else:
-                emp_id = emp_id.upper()
+            email = str(row[email_col]).strip() if email_col and row[email_col] else f"{emp_id.lower()}@office.com"
+            phone = str(row[phone_col]).strip() if phone_col and row[phone_col] else "9999999999"
+            password = str(row[password_col]).strip() if password_col and row[password_col] else "Emp@123"
+            
+            project_val = str(row[project_col]).strip() if project_col and row[project_col] else None
+            cat_val = str(row[cat_col]).strip() if cat_col and row[cat_col] else None
+            desig_val = str(row[desig_col]).strip() if desig_col and row[desig_col] else ''
+            team_str = str(row[team_col]).strip() if team_col and row[team_col] else desig_val
 
-            full_name = clean_val(row['Full Name'])
-            email = clean_val(row['Email']).lower()
-            phone = clean_val(row['Phone'])
-            password = clean_val(row['Password'])
-            designation = clean_val(row[desig_col])
-            category_val = clean_val(row[group_col])
-
-            if not full_name or full_name.lower() == 'nan':
-                continue # Skip empty rows
-
-            # Map designation to team
             team_mapped = None
-            desig_lower = designation.lower()
-            if 'field' in desig_lower:
-                team_mapped = 'field'
-            elif 'coc' in desig_lower or 'cooc' in desig_lower:
-                team_mapped = 'coc'
-            elif 'ccc' in desig_lower:
-                team_mapped = 'ccc'
-            elif 'towing' in desig_lower:
-                team_mapped = 'towing'
+            if team_str:
+                t_low = team_str.lower()
+                if 'field' in t_low: team_mapped = 'field'
+                elif 'coc' in t_low: team_mapped = 'coc'
+                elif 'ccc' in t_low: team_mapped = 'ccc'
+                elif 'towing' in t_low: team_mapped = 'towing'
+                elif 'headoffice' in t_low or 'head office' in t_low: team_mapped = 'headoffice'
 
-            # Normalize category value
-            category_val_lower = category_val.lower()
-            if 'smart' in category_val_lower and 'city' in category_val_lower:
-                category_mapped = 'Smart City'
-            elif 'itms' in category_val_lower:
-                category_mapped = 'IITMS'
-            elif 'towing' in category_val_lower or 'construction' in category_val_lower:
-                category_mapped = 'Towing'
-            else:
-                category_mapped = category_val if category_val else None
+            if not project_val and cat_val in ('Smart City', 'IITMS', 'Towing', 'Head Office'):
+                project_val = cat_val
+            elif not project_val:
+                if team_mapped == 'towing':
+                    project_val = 'Towing'
+                elif team_mapped == 'headoffice':
+                    project_val = 'Head Office'
+                else:
+                    project_val = 'Smart City'
 
-            # Check if email is used by another employee
-            existing_email_emp = Employee.query.filter_by(email=email).first()
-            if existing_email_emp and existing_email_emp.id.strip().upper() != emp_id:
-                return jsonify({'error': f'Email {email} is already in use by employee {existing_email_emp.id}'}), 400
+            if not cat_val:
+                cat_val = project_val
 
-            employee = Employee.query.get(emp_id)
-            if employee:
-                employee.full_name = full_name
-                employee.email = email
-                employee.phone = phone
-                employee.password = password
-                employee.designation = designation
-                employee.team = team_mapped
-                employee.category = category_mapped
-                if emp_id.upper().startswith('ADMIN'):
-                    employee.is_admin = True
-                updated_count += 1
-            else:
-                employee = Employee(
+            desig_val = str(row[desig_col]).strip() if desig_col and row[desig_col] else ''
+            team_str = str(row[team_col]).strip() if team_col and row[team_col] else desig_val
+
+            team_mapped = None
+            if team_str:
+                t_low = team_str.lower()
+                if 'field' in t_low: team_mapped = 'field'
+                elif 'coc' in t_low: team_mapped = 'coc'
+                elif 'ccc' in t_low: team_mapped = 'ccc'
+                elif 'towing' in t_low: team_mapped = 'towing'
+                elif 'headoffice' in t_low or 'head office' in t_low: team_mapped = 'headoffice'
+
+            existing = Employee.query.get(emp_id)
+            if not existing:
+                new_emp = Employee(
                     id=emp_id,
-                    full_name=full_name,
+                    full_name=name,
                     email=email,
                     phone=phone,
                     password=password,
-                    designation=designation,
                     team=team_mapped,
-                    category=category_mapped,
-                    is_admin=emp_id.upper().startswith('ADMIN'),
-                    weekly_off='Sunday',
-                    shift_type='general'
+                    designation=desig_val or team_str,
+                    project=project_val,
+                    category=cat_val,
+                    shift_type=str(row[shift_col]).strip() if shift_col and row[shift_col] else 'general',
+                    weekly_off=str(row[off_col]).strip() if off_col and row[off_col] else 'Sunday'
                 )
-                db.session.add(employee)
+                db.session.add(new_emp)
                 added_count += 1
-
-        # Seed default admin and category admins if they don't exist
-        for adm in [
-            {'id': 'ADMIN001', 'full_name': 'System Administrator', 'email': 'multisulotionsdecofurn@gmail.com', 'phone': '+919518791736', 'password': 'AD#987', 'category': None},
-            {'id': 'smartcity_admin', 'full_name': 'Smart City Admin', 'email': 'smartcity@keltron.com', 'phone': '0000000001', 'password': 'SmartCity@Admin', 'category': 'Smart City'},
-            {'id': 'iitms_admin', 'full_name': 'IITMS Admin', 'email': 'iitms@keltron.com', 'phone': '0000000002', 'password': 'IITMS@Admin', 'category': 'IITMS'},
-            {'id': 'towing_admin', 'full_name': 'Towing Admin', 'email': 'towing@keltron.com', 'phone': '0000000003', 'password': 'Towing@Admin', 'category': 'Towing'}
-        ]:
-            if not Employee.query.get(adm['id']):
-                new_adm = Employee(
-                    id=adm['id'],
-                    full_name=adm['full_name'],
-                    email=adm['email'],
-                    phone=adm['phone'],
-                    password=os.getenv(f"{adm['id']}_PASSWORD", adm['password']),
-                    is_admin=True,
-                    category=adm['category'],
-                    weekly_off='Sunday',
-                    shift_type='general'
-                )
-                db.session.add(new_adm)
-                added_count += 1
+            else:
+                existing.full_name = name
+                if email: existing.email = email
+                if phone: existing.phone = phone
+                if password: existing.password = password
+                if team_mapped: existing.team = team_mapped
+                if desig_val: existing.designation = desig_val
+                existing.project = project_val
+                existing.category = cat_val
+                updated_count += 1
 
         db.session.commit()
-
-        return jsonify({
-            'success': True,
-            'message': f'Uploaded successfully. Added {added_count} new/admin employees and updated {updated_count} existing employees.'
-        })
+        return jsonify({'success': True, 'message': f'Successfully processed employees. Added {added_count} new, updated {updated_count}.'})
 
     except Exception as e:
         db.session.rollback()
+        return jsonify({'error': f'Failed to process employee file: {str(e)}'}), 500
         return jsonify({'error': f'An error occurred during file parsing: {str(e)}'}), 500
 
 
@@ -2241,117 +2273,121 @@ def assign_employees_to_location(location_id):
 def junction_start():
     """Employee arrives at a junction/location: log the 'before' photo + GPS location.
     Available for Field, COC, and CCC team members."""
-    employee_id = request.form.get('employee_id')
-    junction_name = request.form.get('junction_name')
-    location = request.form.get('location')
-    ward = request.form.get('ward')
-    zone = request.form.get('zone')
-    before_remark = request.form.get('before_remark')
+    try:
+        data = request.get_json(silent=True) or {}
+        employee_id = request.form.get('employee_id') or data.get('employee_id')
+        if employee_id and ':' in str(employee_id):
+            employee_id = str(employee_id).split(':')[0].strip()
 
-    if not employee_id or not junction_name or not location:
-        return jsonify({'error': 'employee_id, junction_name and location are required'}), 400
+        junction_name = request.form.get('junction_name') or data.get('junction_name')
+        location = request.form.get('location') or data.get('location')
+        ward = request.form.get('ward') or data.get('ward')
+        zone = request.form.get('zone') or data.get('zone')
+        before_remark = request.form.get('before_remark') or data.get('before_remark')
 
-    employee = Employee.query.get(employee_id)
-    if not employee:
-        return jsonify({'error': 'Employee not found'}), 404
+        if not employee_id or not junction_name or not location:
+            return jsonify({'error': 'employee_id, junction_name and location are required'}), 400
 
-    # Allow all employees to log junction visits (team restriction removed)
-    # Previously: if _team_of(employee) not in ALLOWED_VISIT_TEAMS:
-    #                 return jsonify({'error': 'Location visits are only available for Field, COC, and CCC Team members'}), 403
+        employee = Employee.query.get(employee_id)
+        if not employee:
+            return jsonify({'error': 'Employee not found'}), 404
 
-    today = datetime.utcnow().date()
+        today = datetime.utcnow().date()
 
-    checked_in_today = Attendance.query.filter(
-        Attendance.employee_id == employee_id,
-        Attendance.date == today,
-        Attendance.check_in_time.isnot(None)
-    ).first()
-    if not checked_in_today:
-        return jsonify({'error': 'Please check in for the day before logging a junction visit'}), 400
+        checked_in_today = Attendance.query.filter(
+            Attendance.employee_id == employee_id,
+            Attendance.date == today,
+            Attendance.check_in_time.isnot(None)
+        ).first()
+        if not checked_in_today:
+            return jsonify({'error': 'Please check in for the day before logging a junction visit'}), 400
 
-    # Auto-close any existing open visits ('in_progress') for this employee
-    open_visits = JunctionVisit.query.filter_by(
-        employee_id=employee_id,
-        status='in_progress'
-    ).all()
-    for ov in open_visits:
-        ov.status = 'unresolved'
-        ov.completed_at = datetime.utcnow()
-        ov.remark = 'Unresolved'
+        # Auto-close any existing open visits ('in_progress') for this employee
+        open_visits = JunctionVisit.query.filter_by(
+            employee_id=employee_id,
+            status='in_progress'
+        ).all()
+        for ov in open_visits:
+            ov.status = 'unresolved'
+            ov.completed_at = datetime.utcnow()
+            ov.remark = 'Unresolved'
 
-    # REMOVED: Restriction that blocks a second open visit so employee can visit other locations
-    # if one call is not completed.
-    
-    visit_type = request.form.get('visit_type', 'Regular Visit')
-    asset_type = request.form.get('asset_type')
-    fault_type = request.form.get('fault_type')
+        visit_type = request.form.get('visit_type') or data.get('visit_type') or 'Regular Visit'
+        asset_type = request.form.get('asset_type') or data.get('asset_type')
+        fault_type = request.form.get('fault_type') or data.get('fault_type')
 
-    before_photo_filename = None
-    if 'photo' in request.files:
-        file = request.files['photo']
-        if file and allowed_file(file.filename):
-            filename = secure_filename(
-                f"{employee_id}{datetime.now().strftime('%Y%m%d%H%M%S')}_junction_before.{file.filename.rsplit('.', 1)[1].lower()}"
-            )
-            file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-            before_photo_filename = filename
+        before_photo_filename = None
+        if 'photo' in request.files:
+            file = request.files['photo']
+            if file and allowed_file(file.filename):
+                filename = secure_filename(
+                    f"{employee_id}{datetime.now().strftime('%Y%m%d%H%M%S')}_junction_before.{file.filename.rsplit('.', 1)[1].lower()}"
+                )
+                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
+                before_photo_filename = filename
 
-    if not before_photo_filename:
-        return jsonify({'error': 'Before photo is required'}), 400
+        if not before_photo_filename:
+            before_photo_filename = data.get('before_photo') or data.get('photo')
 
-    is_completed_immediately = (visit_type == 'Regular Visit' and asset_type == 'None')
+        if not before_photo_filename:
+            return jsonify({'error': 'Before photo is required'}), 400
 
-    now_utc = datetime.utcnow()
-    last_visit = JunctionVisit.query.filter_by(employee_id=employee_id, date=today).order_by(JunctionVisit.started_at.desc()).first()
-    prev_finish = (last_visit.completed_at or last_visit.started_at) if last_visit else (checked_in_today.check_in_time if checked_in_today else None)
+        is_completed_immediately = (visit_type == 'Regular Visit' and (not asset_type or asset_type == 'None'))
 
-    calc_travel_mins = 0.0
-    if prev_finish and now_utc > prev_finish:
-        calc_travel_mins = round((now_utc - prev_finish).total_seconds() / 60.0, 1)
+        now_utc = datetime.utcnow()
+        last_visit = JunctionVisit.query.filter_by(employee_id=employee_id, date=today).order_by(JunctionVisit.started_at.desc()).first()
+        prev_finish = (last_visit.completed_at or last_visit.started_at) if last_visit else (checked_in_today.check_in_time if checked_in_today else None)
 
-    visit = JunctionVisit(
-        employee_id=employee_id,
-        junction_name=junction_name.strip(),
-        ward=ward.strip() if ward else None,
-        zone=zone.strip() if zone else None,
-        date=today,
-        before_photo=before_photo_filename,
-        before_location=location,
-        started_at=now_utc,
-        status='completed' if is_completed_immediately else 'in_progress',
-        completed_at=now_utc if is_completed_immediately else None,
-        after_photo=before_photo_filename if is_completed_immediately else None,
-        after_location=location if is_completed_immediately else None,
-        remark='Regular Visit (No Fault)' if is_completed_immediately else None,
-        before_remark=before_remark.strip() if before_remark else None,
-        visit_type=visit_type,
-        asset_type=asset_type,
-        fault_type=fault_type,
-        travel_time_minutes=calc_travel_mins,
-        time_spent_minutes=0.0 if is_completed_immediately else 0.0
-    )
-    db.session.add(visit)
-    db.session.commit()
+        calc_travel_mins = 0.0
+        if prev_finish and now_utc > prev_finish:
+            calc_travel_mins = round((now_utc - prev_finish).total_seconds() / 60.0, 1)
 
+        visit = JunctionVisit(
+            employee_id=employee_id,
+            junction_name=str(junction_name).strip(),
+            ward=str(ward).strip() if ward else None,
+            zone=str(zone).strip() if zone else None,
+            date=today,
+            before_photo=before_photo_filename,
+            before_location=location,
+            started_at=now_utc,
+            status='completed' if is_completed_immediately else 'in_progress',
+            completed_at=now_utc if is_completed_immediately else None,
+            after_photo=before_photo_filename if is_completed_immediately else None,
+            after_location=location if is_completed_immediately else None,
+            remark='Regular Visit (No Fault)' if is_completed_immediately else None,
+            before_remark=str(before_remark).strip() if before_remark else None,
+            visit_type=visit_type,
+            asset_type=asset_type,
+            fault_type=fault_type,
+            travel_time_minutes=calc_travel_mins,
+            time_spent_minutes=0.0
+        )
+        db.session.add(visit)
+        db.session.commit()
 
-    return jsonify({
-        'success': True,
-        'message': 'Junction visit completed' if is_completed_immediately else 'Junction visit started',
-        'visit': {
-            'id': visit.id,
-            'junction_name': visit.junction_name,
-            'ward': visit.ward or '',
-            'zone': visit.zone or '',
-            'started_at': to_ist(visit.started_at),
-            'before_photo': visit.before_photo,
-            'before_location': visit.before_location,
-            'status': visit.status,
-            'visit_type': visit.visit_type,
-            'asset_type': visit.asset_type or '',
-            'fault_type': visit.fault_type or '',
-            'remark': visit.remark
-        }
-    })
+        return jsonify({
+            'success': True,
+            'message': 'Junction visit completed' if is_completed_immediately else 'Junction visit started',
+            'visit': {
+                'id': visit.id,
+                'junction_name': visit.junction_name,
+                'ward': visit.ward or '',
+                'zone': visit.zone or '',
+                'started_at': to_ist(visit.started_at),
+                'before_photo': visit.before_photo,
+                'before_location': visit.before_location,
+                'status': visit.status,
+                'visit_type': visit.visit_type,
+                'asset_type': visit.asset_type or '',
+                'fault_type': visit.fault_type or '',
+                'remark': visit.remark
+            }
+        })
+    except Exception as e:
+        print("JUNCTION START ERROR:", e)
+        db.session.rollback()
+        return jsonify({'error': f'Failed to start junction visit: {str(e)}'}), 500
 
 
 @app.route('/api/junction/<int:visit_id>/complete', methods=['POST'])
@@ -2567,6 +2603,8 @@ def call_visit_complete(visit_id):
 @app.route('/api/junction/today/<employee_id>', methods=['GET'])
 def junction_today(employee_id):
     try:
+        if employee_id and ':' in str(employee_id):
+            employee_id = str(employee_id).split(':')[0].strip()
         today = datetime.utcnow().date()
 
         visits = JunctionVisit.query.filter(
@@ -2876,6 +2914,7 @@ def get_asset_fault_mappings():
 @app.route('/api/admin/junctions/upload', methods=['POST'])
 def upload_junctions_excel():
     """Admin uploads an Excel file with 'Junction Name', 'Ward', and 'Zone' columns to populate the JunctionList table."""
+    category = sanitize_category(request.form.get('category') or request.args.get('category') or request.form.get('project') or request.args.get('project')) or 'Smart City'
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     file = request.files['file']
@@ -3013,9 +3052,9 @@ def upload_junctions_excel():
             if not zone_val or zone_val.lower() == 'nan':
                 zone_val = None
                 
-            exists = JunctionList.query.filter_by(name=name).first()
+            exists = JunctionList.query.filter_by(name=name, category=category).first() if hasattr(JunctionList, 'category') else JunctionList.query.filter_by(name=name).first()
             if not exists:
-                new_j = JunctionList(name=name, ward=ward_val, zone=zone_val)
+                new_j = JunctionList(name=name, ward=ward_val, zone=zone_val, category=category, project=category)
                 db.session.add(new_j)
                 added_count += 1
             else:
@@ -3023,20 +3062,24 @@ def upload_junctions_excel():
                     exists.ward = ward_val
                 if zone_val is not None:
                     exists.zone = zone_val
+                exists.category = category
+                exists.project = category
                 updated_count += 1
 
-            loc_exists = LocationList.query.filter_by(name=name, team='field').first()
+            loc_exists = LocationList.query.filter_by(name=name, team='field', category=category).first() if hasattr(LocationList, 'category') else LocationList.query.filter_by(name=name, team='field').first()
             if not loc_exists:
-                new_loc = LocationList(name=name, team='field', ward=ward_val, zone=zone_val)
+                new_loc = LocationList(name=name, team='field', ward=ward_val, zone=zone_val, category=category, project=category)
                 db.session.add(new_loc)
             else:
                 if ward_val is not None:
                     loc_exists.ward = ward_val
                 if zone_val is not None:
                     loc_exists.zone = zone_val
+                loc_exists.category = category
+                loc_exists.project = category
                  
         db.session.commit()
-        return jsonify({'success': True, 'message': f'Successfully processed junctions. Added {added_count} new, updated {updated_count}.'})
+        return jsonify({'success': True, 'message': f'Successfully processed junctions for {category}. Added {added_count} new, updated {updated_count}.'})
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': f'Failed to process file: {str(e)}'}), 500
@@ -3059,228 +3102,285 @@ def download_junctions_sample_excel():
     return send_file(output, as_attachment=True, download_name=filename,
                      mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
+
 @app.route('/api/admin/team/<team>/summary', methods=['GET'])
 def admin_team_summary(team):
-    """Top-line stats for one team's admin dashboard tab (COC / CCC / Field / Towing)."""
-    team = team.lower()
-    date_str = request.args.get('date')
-    if date_str:
-        try:
-            today = datetime.strptime(date_str, '%Y-%m-%d').date()
-        except ValueError:
+    """Top-line stats for one team's admin dashboard tab (COC / CCC / Field / Towing / Head Office)."""
+    try:
+        team = team.lower()
+        date_str = request.args.get('date')
+        project = sanitize_category(request.args.get('project'))
+        category = sanitize_category(request.args.get('category'))
+        proj_val = project or category
+
+        if date_str:
+            try:
+                today = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                today = datetime.utcnow().date()
+        else:
             today = datetime.utcnow().date()
-    else:
-        today = datetime.utcnow().date()
 
-    if team == 'towing':
-        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
-    else:
-        team_filter = Employee.team == team
+        if team == 'towing':
+            team_filter = or_(func.lower(Employee.team) == 'towing', func.lower(Employee.category) == 'towing')
+        elif team in ('headoffice', 'head_office', 'head-office'):
+            team_filter = or_(func.lower(Employee.team) == 'headoffice', func.lower(Employee.team) == 'head_office')
+        else:
+            team_filter = func.lower(Employee.team) == team
 
-    category = request.args.get('category')
+        filters = [team_filter, or_(Employee.is_admin == False, Employee.is_admin.is_(None))]
+        if proj_val:
+            if proj_val.lower() == 'smart city':
+                filters.append(func.lower(func.coalesce(Employee.project, '')).notlike('%iitms%'))
+                filters.append(func.lower(func.coalesce(Employee.category, '')).notlike('%iitms%'))
+            elif 'iitms' in proj_val.lower():
+                filters.append(or_(func.lower(Employee.project).like('%iitms%'), func.lower(Employee.category).like('%iitms%')))
+            else:
+                filters.append(or_(func.lower(Employee.project) == proj_val.lower(), func.lower(Employee.category) == proj_val.lower()))
 
-    if category:
-        members = Employee.query.filter(team_filter, Employee.is_admin == False, Employee.category == category).all()
-    else:
-        members = Employee.query.filter(team_filter, Employee.is_admin == False).all()
-    member_ids = [m.id for m in members]
+        members = Employee.query.filter(*filters).all()
+        member_ids = [m.id for m in members]
 
-    checked_in_today = 0
-    if member_ids:
-        recs = Attendance.query.filter(
-            Attendance.employee_id.in_(member_ids),
-            Attendance.date == today,
-            Attendance.check_in_time.isnot(None)
-        ).all()
-        checked_in_today = len({r.employee_id for r in recs})
+        checked_in_today = 0
+        checked_in_today = 0
+        ontime = 0
+        late = 0
+        half_day = 0
+        if member_ids:
+            recs = Attendance.query.filter(
+                Attendance.employee_id.in_(member_ids),
+                Attendance.date == today,
+                Attendance.check_in_time.isnot(None)
+            ).all()
+            checked_in_today = len({r.employee_id for r in recs})
+            for r in recs:
+                st = (r.status or '').lower()
+                if 'late' in st:
+                    late += 1
+                elif 'half' in st:
+                    half_day += 1
+                else:
+                    ontime += 1
 
-    junctions_today = 0
-    active_junctions = 0
-    if member_ids and team in ('field', 'coc', 'towing'):
-        junctions_today = JunctionVisit.query.filter(
-            JunctionVisit.employee_id.in_(member_ids),
-            JunctionVisit.date == today
-        ).count()
-        active_junctions = JunctionVisit.query.filter(
-            JunctionVisit.employee_id.in_(member_ids),
-            JunctionVisit.status.in_(['in_progress', 'unresolved']),
-            JunctionVisit.date <= today
-        ).count()
+        junctions_today = 0
+        active_junctions = 0
+        if member_ids and team in ('field', 'coc', 'towing'):
+            junctions_today = JunctionVisit.query.filter(
+                JunctionVisit.employee_id.in_(member_ids),
+                JunctionVisit.date == today
+            ).count()
+            active_junctions = JunctionVisit.query.filter(
+                JunctionVisit.employee_id.in_(member_ids),
+                JunctionVisit.status.in_(['in_progress', 'unresolved']),
+                JunctionVisit.date <= today
+            ).count()
 
-    return jsonify({
-        'team': team,
-        'total_members': len(members),
-        'checked_in_today': checked_in_today,
-        'absent_today': len(members) - checked_in_today,
-        'junctions_today': junctions_today,
-        'active_junctions': active_junctions
-    })
+        return jsonify({
+            'team': team,
+            'total_members': len(members),
+            'checked_in_today': checked_in_today,
+            'ontime': ontime,
+            'late': late,
+            'half_day': half_day,
+            'absent_today': len(members) - checked_in_today,
+            'junctions_today': junctions_today,
+            'active_junctions': active_junctions
+        })
+    except Exception as e:
+        print(f"Error in admin_team_summary: {e}")
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 
 @app.route('/api/admin/team/<team>/employees', methods=['GET'])
 def admin_team_employees(team):
     """Team roster with today's attendance status, for one team's admin dashboard tab."""
-    team = team.lower()
-    date_str = request.args.get('date')
-    if date_str:
-        try:
-            today = datetime.strptime(date_str, '%Y-%m-%d').date()
-        except ValueError:
+    try:
+        team = team.lower()
+        date_str = request.args.get('date')
+        project = sanitize_category(request.args.get('project'))
+        category = sanitize_category(request.args.get('category'))
+        proj_val = project or category
+
+        if date_str:
+            try:
+                today = datetime.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                today = datetime.utcnow().date()
+        else:
             today = datetime.utcnow().date()
-    else:
-        today = datetime.utcnow().date()
 
-    if team == 'towing':
-        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
-    else:
-        team_filter = Employee.team == team
+        if team == 'towing':
+            team_filter = or_(func.lower(Employee.team) == 'towing', func.lower(Employee.category) == 'towing')
+        elif team in ('headoffice', 'head_office', 'head-office'):
+            team_filter = or_(func.lower(Employee.team) == 'headoffice', func.lower(Employee.team) == 'head_office')
+        else:
+            team_filter = func.lower(Employee.team) == team
 
-    category = request.args.get('category')
+        filters = [team_filter, or_(Employee.is_admin == False, Employee.is_admin.is_(None))]
+        if proj_val:
+            if proj_val.lower() == 'smart city':
+                filters.append(func.lower(func.coalesce(Employee.project, '')).notlike('%iitms%'))
+                filters.append(func.lower(func.coalesce(Employee.category, '')).notlike('%iitms%'))
+            elif 'iitms' in proj_val.lower():
+                filters.append(or_(func.lower(Employee.project).like('%iitms%'), func.lower(Employee.category).like('%iitms%')))
+            else:
+                filters.append(or_(func.lower(Employee.project) == proj_val.lower(), func.lower(Employee.category) == proj_val.lower()))
 
-    if category:
-        members = Employee.query.filter(team_filter, Employee.is_admin == False, Employee.category == category).all()
-    else:
-        members = Employee.query.filter(team_filter, Employee.is_admin == False).all()
+        members = Employee.query.filter(*filters).all()
 
-    result = []
-    for m in members:
-        today_records = Attendance.query.filter_by(employee_id=m.id, date=today).order_by(Attendance.id.asc()).all()
-        checked_in = any(r.check_in_time for r in today_records)
-        latest = today_records[-1] if today_records else None
+        result = []
+        for m in members:
+            today_records = Attendance.query.filter_by(employee_id=m.id, date=today).order_by(Attendance.id.asc()).all()
+            checked_in = any(r.check_in_time for r in today_records)
+            latest = today_records[-1] if today_records else None
 
-        result.append({
-            'id': m.id,
-            'full_name': m.full_name,
-            'designation': m.designation,
-            'team': m.team,
-            'checked_in_today': checked_in,
-            'status': latest.status if latest else 'absent',
-            'check_in_time': to_ist(latest.check_in_time) if latest and latest.check_in_time else None,
-            'check_out_time': to_ist(latest.check_out_time) if latest and latest.check_out_time else None
-        })
+            result.append({
+                'id': m.id,
+                'full_name': m.full_name,
+                'designation': m.designation,
+                'team': m.team,
+                'category': m.category,
+                'project': m.project or m.category or 'Smart City',
+                'checked_in_today': checked_in,
+                'status': latest.status if latest else 'absent',
+                'check_in_time': to_ist(latest.check_in_time) if latest and latest.check_in_time else None,
+                'check_out_time': to_ist(latest.check_out_time) if latest and latest.check_out_time else None
+            })
 
-    return jsonify(result)
+        return jsonify(result)
+    except Exception as e:
+        print(f"Error in admin_team_employees: {e}")
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 
 @app.route('/api/admin/team/<team>/junctions', methods=['GET'])
 def admin_team_junctions(team):
     """Junction visit log (before/after photos + locations) for one team's admin dashboard tab.
     Supports ?date=YYYY-MM-DD or ?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD and ?employee_id=..."""
-    team = team.lower()
-    date_filter = request.args.get('date')
-    start_date = request.args.get('start_date')
-    end_date = request.args.get('end_date')
-    employee_id = request.args.get('employee_id')
+    try:
+        team = team.lower()
+        date_filter = request.args.get('date')
+        start_date = request.args.get('start_date')
+        end_date = request.args.get('end_date')
+        employee_id = request.args.get('employee_id')
+        project = sanitize_category(request.args.get('project'))
+        category = sanitize_category(request.args.get('category'))
+        proj_val = project or category
 
-    if team == 'towing':
-        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
-    else:
-        team_filter = Employee.team == team
-
-    category = request.args.get('category')
-
-    if employee_id:
-        emp = Employee.query.get(employee_id)
-        if emp and category and emp.category != category:
-            member_ids = []
+        if team == 'towing':
+            team_filter = or_(func.lower(Employee.team) == 'towing', func.lower(Employee.category) == 'towing')
+        elif team in ('headoffice', 'head_office', 'head-office'):
+            team_filter = or_(func.lower(Employee.team) == 'headoffice', func.lower(Employee.team) == 'head_office')
         else:
+            team_filter = func.lower(Employee.team) == team
+
+        if employee_id:
             member_ids = [employee_id]
-    else:
-        if category:
-            member_ids = [m.id for m in Employee.query.filter(team_filter, Employee.is_admin == False, Employee.category == category).all()]
         else:
-            member_ids = [m.id for m in Employee.query.filter(team_filter, Employee.is_admin == False).all()]
+            emp_filters = [team_filter, or_(Employee.is_admin == False, Employee.is_admin.is_(None))]
+            if proj_val:
+                if proj_val.lower() == 'smart city':
+                    emp_filters.append(func.lower(func.coalesce(Employee.project, '')).notlike('%iitms%'))
+                    emp_filters.append(func.lower(func.coalesce(Employee.category, '')).notlike('%iitms%'))
+                elif 'iitms' in proj_val.lower():
+                    emp_filters.append(or_(func.lower(Employee.project).like('%iitms%'), func.lower(Employee.category).like('%iitms%')))
+                else:
+                    emp_filters.append(or_(func.lower(Employee.project) == proj_val.lower(), func.lower(Employee.category) == proj_val.lower()))
+            member_ids = [m.id for m in Employee.query.filter(*emp_filters).all()]
 
-    if not member_ids:
-        return jsonify([])
+        if not member_ids:
+            return jsonify([])
 
-    query = db.session.query(JunctionVisit, Employee).join(Employee).filter(JunctionVisit.employee_id.in_(member_ids))
+        query = db.session.query(JunctionVisit, Employee).join(Employee).filter(JunctionVisit.employee_id.in_(member_ids))
 
-    if start_date and end_date:
-        try:
-            s_date = datetime.strptime(start_date, '%Y-%m-%d').date()
-            e_date = datetime.strptime(end_date, '%Y-%m-%d').date()
-            query = query.filter(
-                or_(
-                    and_(JunctionVisit.date >= s_date, JunctionVisit.date <= e_date),
-                    and_(db.func.date(JunctionVisit.completed_at) >= s_date, db.func.date(JunctionVisit.completed_at) <= e_date)
-                )
-            )
-        except ValueError:
-            pass
-    elif date_filter:
-        try:
-            target_date = datetime.strptime(date_filter, '%Y-%m-%d').date()
-            query = query.filter(
-                or_(
-                    JunctionVisit.date == target_date,
-                    db.func.date(JunctionVisit.completed_at) == target_date,
-                    and_(
-                        JunctionVisit.status.in_(['in_progress', 'unresolved']),
-                        JunctionVisit.date <= target_date
+        if start_date and end_date:
+            try:
+                s_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+                e_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+                query = query.filter(
+                    or_(
+                        and_(JunctionVisit.date >= s_date, JunctionVisit.date <= e_date),
+                        and_(db.func.date(JunctionVisit.completed_at) >= s_date, db.func.date(JunctionVisit.completed_at) <= e_date)
                     )
                 )
-            )
-        except ValueError:
-            pass
+            except ValueError:
+                pass
+        elif date_filter:
+            try:
+                target_date = datetime.strptime(date_filter, '%Y-%m-%d').date()
+                query = query.filter(
+                    or_(
+                        JunctionVisit.date == target_date,
+                        db.func.date(JunctionVisit.completed_at) == target_date,
+                        and_(
+                            JunctionVisit.status.in_(['in_progress', 'unresolved']),
+                            JunctionVisit.date <= target_date
+                        )
+                    )
+                )
+            except ValueError:
+                pass
 
-    results = query.order_by(JunctionVisit.id.desc()).all()
+        results = query.order_by(JunctionVisit.id.desc()).all()
 
-    junction_names = list(set([v.junction_name for v, e in results]))
-    counts_map = {}
-    if junction_names:
-        # Count main visits
-        main_counts = db.session.query(
-            JunctionVisit.junction_name, 
-            db.func.count(JunctionVisit.id)
-        ).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
-        
-        # Count call visits
-        call_counts = db.session.query(
-            JunctionVisit.junction_name, 
-            db.func.count(CallVisit.id)
-        ).join(CallVisit).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
-        
-        main_map = {name: count for name, count in main_counts}
-        call_map = {name: count for name, count in call_counts}
-        counts_map = {name: main_map.get(name, 0) + call_map.get(name, 0) for name in junction_names}
+        junction_names = list(set([v.junction_name for v, e in results]))
+        counts_map = {}
+        if junction_names:
+            # Count main visits
+            main_counts = db.session.query(
+                JunctionVisit.junction_name, 
+                db.func.count(JunctionVisit.id)
+            ).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
+            
+            # Count call visits
+            call_counts = db.session.query(
+                JunctionVisit.junction_name, 
+                db.func.count(CallVisit.id)
+            ).join(CallVisit).filter(JunctionVisit.junction_name.in_(junction_names)).group_by(JunctionVisit.junction_name).all()
+            
+            main_map = {name: count for name, count in main_counts}
+            call_map = {name: count for name, count in call_counts}
+            counts_map = {name: main_map.get(name, 0) + call_map.get(name, 0) for name in junction_names}
 
-    return jsonify([{
-        'id': v.id,
-        'employee_id': v.employee_id,
-        'employee_name': e.full_name,
-        'junction_name': v.junction_name,
-        'visit_count': counts_map.get(v.junction_name, 0),
-        'ward': v.ward or '',
-        'zone': v.zone or '',
-        'date': v.date.isoformat(),
-        'before_photo': v.before_photo,
-        'after_photo': v.after_photo,
-        'before_location': v.before_location,
-        'after_location': v.after_location,
-        'started_at': to_ist(v.started_at),
-        'completed_at': to_ist(v.completed_at),
-        'time_spent_minutes': getattr(v, 'time_spent_minutes', 0.0) or 0.0,
-        'travel_time_minutes': getattr(v, 'travel_time_minutes', 0.0) or 0.0,
-        'status': v.status,
-        'visit_type': v.visit_type,
-        'asset_type': v.asset_type or '',
-        'fault_type': v.fault_type or '',
-        'remark': 'Unresolved' if v.remark == 'Auto-closed (Left unresolved)' else (v.remark or ''),
-        'before_remark': v.before_remark or '',
-        'call_visits': [{
-            'id': cv.id,
-            'before_photo': cv.before_photo,
-            'after_photo': cv.after_photo,
-            'before_location': cv.before_location,
-            'after_location': cv.after_location,
-            'started_at': to_ist(cv.started_at),
-            'completed_at': to_ist(cv.completed_at),
-            'before_remark': cv.before_remark or '',
-            'remark': cv.remark or '',
-            'status': cv.status
-        } for cv in sorted(v.call_visits, key=lambda x: x.id)]
-    } for v, e in results])
+        return jsonify([{
+            'id': v.id,
+            'employee_id': v.employee_id,
+            'employee_name': e.full_name,
+            'junction_name': v.junction_name,
+            'visit_count': counts_map.get(v.junction_name, 0),
+            'ward': v.ward or '',
+            'zone': v.zone or '',
+            'date': v.date.isoformat(),
+            'before_photo': v.before_photo,
+            'after_photo': v.after_photo,
+            'before_location': v.before_location,
+            'after_location': v.after_location,
+            'started_at': to_ist(v.started_at),
+            'completed_at': to_ist(v.completed_at),
+            'time_spent_minutes': getattr(v, 'time_spent_minutes', 0.0) or 0.0,
+            'travel_time_minutes': getattr(v, 'travel_time_minutes', 0.0) or 0.0,
+            'status': v.status,
+            'visit_type': v.visit_type,
+            'asset_type': v.asset_type or '',
+            'fault_type': v.fault_type or '',
+            'remark': 'Unresolved' if v.remark == 'Auto-closed (Left unresolved)' else (v.remark or ''),
+            'before_remark': v.before_remark or '',
+            'call_visits': [{
+                'id': cv.id,
+                'before_photo': cv.before_photo,
+                'after_photo': cv.after_photo,
+                'before_location': cv.before_location,
+                'after_location': cv.after_location,
+                'started_at': to_ist(cv.started_at),
+                'completed_at': to_ist(cv.completed_at),
+                'before_remark': cv.before_remark or '',
+                'remark': cv.remark or '',
+                'status': cv.status
+            } for cv in sorted(v.call_visits, key=lambda x: x.id)]
+        } for v, e in results])
+    except Exception as e:
+        print(f"Error in admin_team_junctions: {e}")
+        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 
 @app.route('/api/admin/field-activity-tracker', methods=['GET'])
@@ -3292,19 +3392,31 @@ def admin_field_activity_tracker():
     date_str = request.args.get('date')
     start_date_str = request.args.get('start_date')
     end_date_str = request.args.get('end_date')
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
 
     if team == 'towing':
-        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+        team_filter = or_(func.lower(Employee.team) == 'towing', func.lower(Employee.category) == 'towing')
+    elif team in ('headoffice', 'head_office', 'head-office'):
+        team_filter = or_(func.lower(Employee.team) == 'headoffice', func.lower(Employee.team) == 'head_office')
     else:
-        team_filter = Employee.team == team
+        team_filter = func.lower(Employee.team) == team
+
+    filters = [team_filter, or_(Employee.is_admin == False, Employee.is_admin.is_(None))]
 
     if employee_id:
-        emps = Employee.query.filter(Employee.id == employee_id).all()
-    elif category:
-        emps = Employee.query.filter(team_filter, Employee.is_admin == False, Employee.category == category).all()
-    else:
-        emps = Employee.query.filter(team_filter, Employee.is_admin == False).all()
+        filters.append(Employee.id == employee_id)
+
+    if category:
+        c_low = category.lower()
+        if c_low == 'smart city':
+            filters.append(func.lower(func.coalesce(Employee.project, '')).notlike('%iitms%'))
+            filters.append(func.lower(func.coalesce(Employee.category, '')).notlike('%iitms%'))
+        elif 'iitms' in c_low:
+            filters.append(or_(func.lower(Employee.project).like('%iitms%'), func.lower(Employee.category).like('%iitms%')))
+        else:
+            filters.append(or_(func.lower(Employee.project) == c_low, func.lower(Employee.category) == c_low))
+
+    emps = Employee.query.filter(*filters).all()
 
     if not emps:
         return jsonify([])
@@ -3502,21 +3614,21 @@ def admin_team_junctions_export(team):
     employee_id = request.args.get('employee_id')
     
     if team == 'towing':
-        team_filter = or_(Employee.team == 'towing', Employee.category == 'Towing')
+        team_filter = or_(func.lower(Employee.team) == 'towing', func.lower(Employee.category) == 'towing')
     else:
-        team_filter = Employee.team == team
+        team_filter = func.lower(Employee.team) == team
 
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
 
     if employee_id:
         emp = Employee.query.get(employee_id)
-        if emp and category and emp.category != category:
+        if emp and category and (emp.category or '').lower() != category.lower():
             member_ids = []
         else:
             member_ids = [employee_id]
     else:
         if category:
-            member_ids = [m.id for m in Employee.query.filter(team_filter, Employee.is_admin == False, Employee.category == category).all()]
+            member_ids = [m.id for m in Employee.query.filter(team_filter, Employee.is_admin == False, func.lower(Employee.category) == category.lower()).all()]
         else:
             member_ids = [m.id for m in Employee.query.filter(team_filter, Employee.is_admin == False).all()]
 
@@ -3765,11 +3877,11 @@ def get_junction_remarks():
     end_date = request.args.get('end_date')
     employee_id = request.args.get('employee_id')
     team = request.args.get('team')
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
 
     query = db.session.query(JunctionRemark, Employee).join(Employee)
     if category:
-        query = query.filter(Employee.category == category)
+        query = query.filter(func.lower(Employee.category) == category.lower())
 
     if start_date and end_date:
         try:
@@ -3792,7 +3904,7 @@ def get_junction_remarks():
         query = query.filter(JunctionRemark.employee_id == employee_id)
 
     if team:
-        query = query.filter(Employee.team == team.lower())
+        query = query.filter(func.lower(Employee.team) == team.lower())
 
     results = query.order_by(JunctionRemark.id.desc()).all()
 
@@ -3815,11 +3927,11 @@ def admin_remarks_export():
     end_date = request.args.get('end_date')
     employee_id = request.args.get('employee_id')
     team = request.args.get('team')
-    category = request.args.get('category')
+    category = sanitize_category(request.args.get('category'))
 
     query = db.session.query(JunctionRemark, Employee).join(Employee)
     if category:
-        query = query.filter(Employee.category == category)
+        query = query.filter(func.lower(Employee.category) == category.lower())
 
     if start_date and end_date:
         try:
@@ -3842,7 +3954,7 @@ def admin_remarks_export():
         query = query.filter(JunctionRemark.employee_id == employee_id)
 
     if team:
-        query = query.filter(Employee.team == team.lower())
+        query = query.filter(func.lower(Employee.team) == team.lower())
 
     results = query.order_by(JunctionRemark.id.desc()).all()
 
